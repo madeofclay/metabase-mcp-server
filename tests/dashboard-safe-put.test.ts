@@ -84,6 +84,7 @@ describe('putDashboardSafe', () => {
     const { client } = mockClient();
     const result = await client.updateDashboardCards(7, dashboardWithTabs().dashcards);
     expect(result.previous_revision_id).toBe(42);
+    expect(result.warning).toBeUndefined();
   });
 
   it('still writes when the revisions cannot be read, saying so', async () => {
@@ -91,6 +92,7 @@ describe('putDashboardSafe', () => {
     const result = await client.updateDashboardCards(7, dashboardWithTabs().dashcards);
     expect(put).toHaveBeenCalled();
     expect(result.previous_revision_id).toBeNull();
+    expect(result.warning).toBe('no se pudo leer la revisión previa; no habrá revert automático');
   });
 
   it('summarizes what the write changes', async () => {
@@ -129,9 +131,23 @@ describe('dashcard operations', () => {
     expect(sent.tabs).toHaveLength(2);
   });
 
-  it('addCardToDashboard asks for a tab on a dashboard with tabs', async () => {
+  it('addCardToDashboard puts the card in the first tab when none is given, and says so', async () => {
+    const { client, body } = mockClient();
+    const result = await client.addCardToDashboard(7, { card_id: 9 });
+    expect(body().dashcards[2].dashboard_tab_id).toBe(10);
+    expect(result.placed_in_tab).toEqual({ id: 10, name: 'Resumen', defaulted: true });
+  });
+
+  it('addCardToDashboard still refuses an explicit tab that does not exist', async () => {
+    const { client, put } = mockClient();
+    await expect(client.addCardToDashboard(7, { card_id: 9, dashboard_tab_id: 99 })).rejects.toThrow(/tab 99/);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('addCardToDashboard reports the explicit tab it used', async () => {
     const { client } = mockClient();
-    await expect(client.addCardToDashboard(7, { card_id: 9 })).rejects.toThrow(/dashboard_tab_id/);
+    const result = await client.addCardToDashboard(7, { card_id: 9, dashboard_tab_id: 11 });
+    expect(result.placed_in_tab).toEqual({ id: 11, name: 'Detalle' });
   });
 
   it('updateDashcard changes one dashcard and leaves the rest and the tabs alone', async () => {

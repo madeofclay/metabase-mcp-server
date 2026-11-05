@@ -16,6 +16,23 @@ import {
     User
 } from "../types/metabase.js";
 
+export interface SafePutResult {
+  dashboard: any;
+  previous_revision_id: number | null;
+  diff: {
+    dashcards: { added: number; kept: number; removed: number[] };
+    tabs: { added: number; kept: number; removed: number[] };
+  };
+  warning?: string;
+  dry_run?: true;
+  payload?: any;
+}
+
+/** A dashboard's tabs in display order. */
+function orderedTabs(tabs: any[] | undefined): any[] {
+  return [...(tabs || [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+}
+
 export class MetabaseClient {
   private axiosInstance: AxiosInstance;
   private sessionToken: string | null = null;
@@ -295,17 +312,18 @@ export class MetabaseClient {
    * 3. When there are tabs, refuses dashcards without a `dashboard_tab_id`, or
    *    pointing at a tab that is not in the list.
    * 4. Records the revision before the write, so it can be undone with
-   *    revert_dashboard, and returns it with a summary of what changed.
+   *    revert_dashboard, and returns it with a summary of what changed. When
+   *    the revisions cannot be read it still writes, with a warning.
+   *
+   * With `dryRun`, validates and returns the summary and the payload it would
+   * send, without writing. `current` skips the GET when the caller already has it.
    */
-  async putDashboardSafe(dashboardId: number, body: { dashcards?: any[]; tabs?: any[]; [key: string]: any }): Promise<{
-    dashboard: any;
-    previous_revision_id: number | null;
-    diff: {
-      dashcards: { added: number; kept: number; removed: number[] };
-      tabs: { added: number; kept: number; removed: number[] };
-    };
-  }> {
-    const current: any = await this.getDashboard(dashboardId);
+  async putDashboardSafe(
+    dashboardId: number,
+    body: { dashcards?: any[]; tabs?: any[]; [key: string]: any },
+    opts: { dryRun?: boolean; current?: any } = {},
+  ): Promise<SafePutResult> {
+    const current: any = opts.current ?? await this.getDashboard(dashboardId);
     const currentDashcards: any[] = current.dashcards || [];
     const currentTabs: any[] = current.tabs || [];
 
@@ -337,9 +355,6 @@ export class MetabaseClient {
       payload.dashcards = nextDashcards;
     }
 
-    const previous_revision_id = await this.latestRevisionId(dashboardId);
-    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, payload);
-
     const diffOf = (before: any[], after: any[] | undefined) => {
       if (after === undefined) return { added: 0, kept: before.length, removed: [] as number[] };
       const afterIds = new Set(after.filter((x) => x.id > 0).map((x) => x.id));
@@ -350,14 +365,22 @@ export class MetabaseClient {
       };
     };
 
-    return {
-      dashboard: response.data,
-      previous_revision_id,
-      diff: {
-        dashcards: diffOf(currentDashcards, nextDashcards),
-        tabs: diffOf(currentTabs, payload.tabs),
-      },
+    const diff = {
+      dashcards: diffOf(currentDashcards, nextDashcards),
+      tabs: diffOf(currentTabs, payload.tabs),
     };
+
+    if (opts.dryRun) {
+      return { dashboard: null, previous_revision_id: null, diff, dry_run: true, payload };
+    }
+
+    const previous_revision_id = await this.latestRevisionId(dashboardId);
+    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, payload);
+    const result: SafePutResult = { dashboard: response.data, previous_revision_id, diff };
+    if (previous_revision_id === null) {
+      result.warning = 'no se pudo leer la revisión previa; no habrá revert automático';
+    }
+    return result;
   }
 
   async addCardToDashboard(dashboardId: number, cardData: any): Promise<any> {
@@ -378,11 +401,30 @@ export class MetabaseClient {
     // card_id stays null for text and heading cards.
     const cardId = cardData.cardId ?? cardData.card_id;
     if (cardId !== undefined) newDashcard.card_id = cardId;
-    if (cardData.dashboard_tab_id !== undefined) newDashcard.dashboard_tab_id = cardData.dashboard_tab_id;
     if (cardData.inline_parameters !== undefined) newDashcard.inline_parameters = cardData.inline_parameters;
     if (cardData.action_id !== undefined) newDashcard.action_id = cardData.action_id;
 
-    return this.putDashboardSafe(dashboardId, { dashcards: [...existing, newDashcard] });
+    // On a dashboard with tabs every dashcard needs one: without an explicit tab
+    // it goes to the first. An explicit tab that does not exist still fails.
+    const tabs = orderedTabs(dashboard.tabs);
+    let placedInTab: any;
+    if (cardData.dashboard_tab_id !== undefined && cardData.dashboard_tab_id !== null) {
+      newDashcard.dashboard_tab_id = cardData.dashboard_tab_id;
+    } else if (tabs.length > 0) {
+      newDashcard.dashboard_tab_id = tabs[0].id;
+      placedInTab = { id: tabs[0].id, name: tabs[0].name, defaulted: true };
+    }
+
+    const result: any = await this.putDashboardSafe(
+      dashboardId,
+      { dashcards: [...existing, newDashcard] },
+      { current: dashboard },
+    );
+    if (newDashcard.dashboard_tab_id !== undefined) {
+      const tab = tabs.find((t: any) => t.id === newDashcard.dashboard_tab_id);
+      result.placed_in_tab = placedInTab ?? { id: newDashcard.dashboard_tab_id, name: tab?.name };
+    }
+    return result;
   }
 
   /** Replaces ALL dashcards: any existing dashcard missing from `cards` is deleted. */
