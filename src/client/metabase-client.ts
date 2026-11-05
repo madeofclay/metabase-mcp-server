@@ -28,6 +28,10 @@ export interface SafePutResult {
   payload?: any;
 }
 
+function tabList(tabs: any[]): string {
+  return tabs.length ? tabs.map((t) => `${t.id} (${t.name})`).join(', ') : 'none';
+}
+
 /** A dashboard's tabs in display order. */
 function orderedTabs(tabs: any[] | undefined): any[] {
   return [...(tabs || [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
@@ -424,6 +428,110 @@ export class MetabaseClient {
       const tab = tabs.find((t: any) => t.id === newDashcard.dashboard_tab_id);
       result.placed_in_tab = placedInTab ?? { id: newDashcard.dashboard_tab_id, name: tab?.name };
     }
+    return result;
+  }
+
+  /**
+   * Sets a dashboard's tabs: `tabs` is the full list in the desired order. A
+   * tab without id (or with a negative one) is created; an existing tab missing
+   * from the list is deleted.
+   *
+   * Dashcards are never deleted in passing: when a deleted tab holds any, the
+   * call fails unless `moveCardsFromDeletedTo` names where they go (an id from
+   * the new list, or a position in it). A dashboard without tabs that gets some
+   * moves all its dashcards to the first one, as Metabase requires. Removing
+   * every tab (back to a dashboard without tabs) needs `confirm`.
+   */
+  async manageDashboardTabs(
+    dashboardId: number,
+    tabs: { id?: number; name: string }[],
+    opts: { moveCardsFromDeletedTo?: number; dryRun?: boolean; confirm?: boolean } = {},
+  ): Promise<any> {
+    const current: any = await this.getDashboard(dashboardId);
+    const currentTabs = orderedTabs(current.tabs);
+    const currentIds = new Set(currentTabs.map((t: any) => t.id));
+    const dashcards: any[] = current.dashcards || [];
+
+    // Ids for the new list: existing tabs keep theirs, new ones get negative ids.
+    const taken = new Set<number>();
+    for (const t of tabs) {
+      if (t.id === undefined) continue;
+      if (t.id === 0) throw new Error('Tab id 0 is not valid: omit the id for a new tab');
+      if (t.id > 0 && !currentIds.has(t.id)) {
+        throw new Error(`Tab ${t.id} is not in dashboard ${dashboardId}. Tabs: ${tabList(currentTabs)}`);
+      }
+      if (taken.has(t.id)) throw new Error(`Tab ${t.id} appears twice in the list`);
+      taken.add(t.id);
+    }
+    let nextNew = -1;
+    const nextTabs = tabs.map((t) => {
+      const name = (t.name || '').trim();
+      if (!name) throw new Error('Every tab needs a name');
+      let id = t.id;
+      if (id === undefined) {
+        while (taken.has(nextNew)) nextNew--;
+        id = nextNew;
+        taken.add(id);
+      }
+      return { id, name };
+    });
+
+    const keptIds = new Set(nextTabs.filter((t) => t.id > 0).map((t) => t.id));
+    const deleted = currentTabs.filter((t: any) => !keptIds.has(t.id));
+    const moved: { from_tab: { id: number; name: string } | null; to_tab: { id: number; name: string }; cards: number }[] = [];
+    let nextDashcards = dashcards;
+
+    if (nextTabs.length === 0) {
+      if (currentTabs.length === 0) throw new Error(`Dashboard ${dashboardId} has no tabs and the list is empty: nothing to do`);
+      if (!opts.confirm) {
+        throw new Error(
+          `Removing every tab turns dashboard ${dashboardId} back into one without tabs, with its ${dashcards.length} cards on a single page. Pass confirm: true to do it.`
+        );
+      }
+      nextDashcards = dashcards.map((dc) => ({ ...dc, dashboard_tab_id: null }));
+    } else if (currentTabs.length === 0) {
+      const first = nextTabs[0];
+      nextDashcards = dashcards.map((dc) => ({ ...dc, dashboard_tab_id: first.id }));
+      if (dashcards.length) moved.push({ from_tab: null, to_tab: first, cards: dashcards.length });
+    } else {
+      const holding = deleted
+        .map((t: any) => ({ tab: t, cards: dashcards.filter((dc) => dc.dashboard_tab_id === t.id).length }))
+        .filter((h) => h.cards > 0);
+      if (holding.length) {
+        const dest = opts.moveCardsFromDeletedTo;
+        if (dest === undefined) {
+          const detail = holding.map((h) => `"${h.tab.name}" (${h.tab.id}) has ${h.cards} cards`).join('; ');
+          throw new Error(
+            `Deleting these tabs would delete their cards: ${detail}. Pass move_cards_from_deleted_to with a tab id from the new list or its position (0 = first).`
+          );
+        }
+        const target =
+          nextTabs.find((t) => t.id === dest) ??
+          (Number.isInteger(dest) && dest >= 0 && dest < nextTabs.length ? nextTabs[dest] : undefined);
+        if (!target) {
+          throw new Error(`move_cards_from_deleted_to=${dest} is neither a tab id in the new list nor a position in it`);
+        }
+        const fromIds = new Set(holding.map((h) => h.tab.id));
+        nextDashcards = dashcards.map((dc) => (fromIds.has(dc.dashboard_tab_id) ? { ...dc, dashboard_tab_id: target.id } : dc));
+        for (const h of holding) moved.push({ from_tab: { id: h.tab.id, name: h.tab.name }, to_tab: target, cards: h.cards });
+      }
+    }
+
+    const result: any = await this.putDashboardSafe(
+      dashboardId,
+      { tabs: nextTabs, dashcards: nextDashcards },
+      { current, dryRun: opts.dryRun },
+    );
+    result.moved_cards = moved;
+    result.deleted_tabs = deleted.map((t: any) => ({ id: t.id, name: t.name }));
+
+    if (opts.dryRun) {
+      result.tabs = nextTabs;
+      return result;
+    }
+    // New tabs only get their real ids from Metabase: read them back.
+    const after: any = await this.getDashboard(dashboardId);
+    result.tabs = orderedTabs(after.tabs).map((t: any) => ({ id: t.id, name: t.name, position: t.position }));
     return result;
   }
 

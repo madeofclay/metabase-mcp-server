@@ -465,6 +465,51 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     },
   });
 
+  server.addTool({
+    name: "manage_dashboard_tabs",
+    description:
+      "Create, rename, reorder or delete a dashboard's tabs in one call. Pass the FULL list of tabs in the desired order: a tab without id is created, an existing tab missing from the list is deleted. Cards are never deleted silently: if a deleted tab has cards, pass move_cards_from_deleted_to (a tab id from the new list, or its position, 0 = first). A dashboard without tabs that gets tabs moves all its cards to the first one. Removing every tab needs confirm: true. Use dry_run: true to preview. Returns the tabs with their real ids, what moved, and previous_revision_id to undo with revert_dashboard.",
+    metadata: { isWrite: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      tabs: z
+        .array(z.object({
+          id: z.number().optional().describe("Existing tab id to keep, rename or move; omit for a new tab"),
+          name: z.string().min(1).describe("Tab name"),
+        }).strict())
+        .describe("Every tab the dashboard should have, in display order"),
+      move_cards_from_deleted_to: z
+        .number()
+        .optional()
+        .describe("Where the cards of deleted tabs go: a tab id from the new list, or its position in it (0 = first)"),
+      dry_run: z.boolean().optional().describe("Validate and show what would change, without writing"),
+      confirm: z.boolean().optional().describe("Required to remove every tab"),
+    }).strict(),
+    execute: async (args: {
+      dashboard_id: number;
+      tabs: { id?: number; name: string }[];
+      move_cards_from_deleted_to?: number;
+      dry_run?: boolean;
+      confirm?: boolean;
+    }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.manageDashboardTabs(args.dashboard_id, args.tabs, {
+          moveCardsFromDeletedTo: args.move_cards_from_deleted_to,
+          dryRun: args.dry_run,
+          confirm: args.confirm,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to update the tabs of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
   /**
    * Add a text block or heading to a dashboard
    *
