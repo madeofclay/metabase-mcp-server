@@ -42,6 +42,41 @@ function tabList(tabs: any[]): string {
 
 const GRID_COLUMNS = 24;
 
+/** The filter type that feeds each variable type when none is given. */
+const DEFAULT_FILTER_TYPE: Record<string, string> = { date: 'date/single', text: 'category', number: 'number/=' };
+
+/** A filter value as Metabase expects it: lists for string/* and number/*, a string for dates. */
+function filterValue(type: string, value: unknown): unknown {
+  if (type.startsWith('string/') || type.startsWith('number/')) return Array.isArray(value) ? value : [value];
+  if (type.startsWith('date/')) return Array.isArray(value) ? String(value[0]) : String(value);
+  return value;
+}
+
+function errorText(err: any): string {
+  const data = err?.response?.data;
+  if (data) return typeof data === 'string' ? data : data.message || data.error || JSON.stringify(data);
+  if (typeof err === 'string') return err;
+  return err?.message || JSON.stringify(err);
+}
+
+function truncate(text: string, max = 300): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/** Maps with at most `limit` promises in flight, keeping the input order. */
+async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 /**
  * The new tab list with ids: existing tabs keep theirs, new ones get negative
  * ids. Verified on Metabase 0.63 (dashboard 621): one PUT with negative tab ids
@@ -799,6 +834,151 @@ export class MetabaseClient {
       }
     }
     return result;
+  }
+
+  /**
+   * Runs every question of a dashboard the way the dashboard runs it: through
+   * the dashcard endpoint, which applies that dashcard's filter mappings. Only
+   * the filters given in `values` are sent. Text cards are skipped. Runs at
+   * most `concurrency` (3) queries at a time, to go easy on the warehouse.
+   *
+   * Verified on 0.63: with target ['variable', ['template-tag', x]] and a
+   * 'date/month-year' value '2026-12', the 16 cards of dashboard 621 ran
+   * without error (13 empty, as expected for a month with no data).
+   */
+  async runDashcards(
+    dashboardId: number,
+    opts: { tab?: number | string; values?: Record<string, unknown>; concurrency?: number } = {},
+  ): Promise<any> {
+    const dashboard: any = await this.getDashboard(dashboardId);
+    const tabs = orderedTabs(dashboard.tabs);
+    const tabPos = new Map(tabs.map((t: any, i: number) => [t.id, i]));
+    const tabName = new Map(tabs.map((t: any) => [t.id, t.name]));
+    const filters = new Map<string, any>((dashboard.parameters || []).map((p: any) => [p.id, p]));
+    const values = opts.values || {};
+
+    const unknown = Object.keys(values).filter((id) => !filters.has(id));
+    if (unknown.length) {
+      throw new Error(`values names filters not on dashboard ${dashboardId}: ${unknown.join(', ')}. Filters: ${[...filters.keys()].join(', ') || 'none'}`);
+    }
+
+    let tabId: number | undefined;
+    if (opts.tab !== undefined) {
+      const match = tabs.find((t: any) => t.id === opts.tab || String(t.name).toLowerCase() === String(opts.tab).toLowerCase());
+      if (!match) throw new Error(`Tab "${opts.tab}" is not in dashboard ${dashboardId}. Tabs: ${tabList(tabs)}`);
+      tabId = match.id;
+    }
+
+    const toRun = (dashboard.dashcards || [])
+      .filter((dc: any) => dc.card_id !== null && dc.card_id !== undefined)
+      .filter((dc: any) => tabId === undefined || dc.dashboard_tab_id === tabId)
+      .sort((a: any, b: any) =>
+        (tabPos.get(a.dashboard_tab_id) ?? 0) - (tabPos.get(b.dashboard_tab_id) ?? 0) || a.row - b.row || a.col - b.col);
+
+    const runOne = async (dc: any) => {
+      const parameters = (dc.parameter_mappings || [])
+        .filter((m: any) => m.parameter_id in values)
+        .map((m: any) => {
+          const filter = filters.get(m.parameter_id);
+          return { id: m.parameter_id, type: filter.type, target: m.target, value: filterValue(filter.type, values[m.parameter_id]) };
+        });
+      const base = {
+        tab: dc.dashboard_tab_id !== undefined && dc.dashboard_tab_id !== null ? tabName.get(dc.dashboard_tab_id) ?? dc.dashboard_tab_id : null,
+        dashcard_id: dc.id,
+        card_id: dc.card_id,
+        name: dc.card?.name ?? null,
+        hide_empty: Boolean(dc.visualization_settings?.['card.hide_empty']),
+      };
+      try {
+        const res = await this.axiosInstance.post(
+          `/api/dashboard/${dashboardId}/dashcard/${dc.id}/card/${dc.card_id}/query`,
+          { parameters },
+        );
+        const data = res.data || {};
+        if (data.status === 'failed' || data.error) {
+          return { ...base, status: 'error', rows: 0, error: truncate(errorText(data.error ?? data)) };
+        }
+        const rows = Array.isArray(data.data?.rows) ? data.data.rows.length : (data.row_count ?? 0);
+        return { ...base, status: rows === 0 ? 'empty' : 'ok', rows };
+      } catch (err) {
+        return { ...base, status: 'error', rows: 0, error: truncate(errorText(err)) };
+      }
+    };
+
+    const results = await mapLimited(toRun, Math.max(1, Math.min(opts.concurrency ?? 3, 3)), runOne);
+    const totals = { ok: 0, empty: 0, errors: 0 };
+    for (const r of results) {
+      if (r.status === 'ok') totals.ok++;
+      else if (r.status === 'empty') totals.empty++;
+      else totals.errors++;
+    }
+    return { dashboard_id: dashboardId, values, totals, cards: results };
+  }
+
+  /**
+   * Runs a native query without saving it, sending filter values the way a
+   * dashboard would. For SQL it builds an MBQL 5 query with a template tag per
+   * {{variable}}; each value goes as a parameter whose type is `filterTypes`
+   * for that variable (e.g. 'date/month-year', 'string/='), or the plain type of
+   * the variable. Optional [[ ]] clauses whose variable gets no value drop out.
+   * With `collection` it runs a MongoDB pipeline instead.
+   *
+   * Verified on 0.63: this MBQL 5 body with 'date/month-year' and 'string/='
+   * parameters on date and text variables runs.
+   */
+  async testNativeQuery(
+    databaseId: number,
+    sql: string,
+    opts: {
+      templateTags?: Record<string, TagOverride>;
+      values?: Record<string, unknown>;
+      filterTypes?: Record<string, string>;
+      collection?: string;
+      limitRows?: number;
+    } = {},
+  ): Promise<any> {
+    const limit = opts.limitRows ?? 20;
+    const values = opts.values || {};
+    let body: any;
+    if (opts.collection) {
+      if (Object.keys(values).length) throw new Error('values are not supported for MongoDB queries');
+      body = { type: 'native', database: databaseId, native: { query: sql, collection: opts.collection }, parameters: [] };
+    } else {
+      const tags = buildTemplateTags(sql, 'test', opts.templateTags || {});
+      const tagType = new Map(tags.map((t) => [t.name, t.type]));
+      const parameters = Object.entries(values).map(([tag, value]) => {
+        const varType = tagType.get(tag);
+        if (!varType) throw new Error(`values names {{${tag}}}, which the query does not have`);
+        const type = opts.filterTypes?.[tag] ?? DEFAULT_FILTER_TYPE[varType] ?? 'category';
+        return { type, value: filterValue(type, value), target: ['variable', ['template-tag', tag]] };
+      });
+      body = {
+        'lib/type': 'mbql/query',
+        database: databaseId,
+        stages: [{ 'lib/type': 'mbql.stage/native', native: sql, 'template-tags': tags }],
+        parameters,
+      };
+    }
+
+    try {
+      const res = await this.axiosInstance.post('/api/dataset', body);
+      const data = res.data || {};
+      const nativeSql = data.data?.native_form?.query;
+      if (data.status === 'failed' || data.error) {
+        return { status: 'error', error: truncate(errorText(data.error ?? data), 1000), ...(nativeSql && { native_sql: nativeSql }) };
+      }
+      const rows: any[] = data.data?.rows || [];
+      return {
+        status: rows.length ? 'ok' : 'empty',
+        columns: (data.data?.cols || []).map((c: any) => c.display_name || c.name),
+        rows: rows.slice(0, limit),
+        row_count: data.row_count ?? rows.length,
+        truncated: rows.length > limit,
+        ...(nativeSql && { native_sql: nativeSql }),
+      };
+    } catch (err) {
+      return { status: 'error', error: truncate(errorText(err), 1000) };
+    }
   }
 
   /** Replaces ALL dashcards: any existing dashcard missing from `cards` is deleted. */

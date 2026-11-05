@@ -466,6 +466,31 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
   });
 
   server.addTool({
+    name: "run_dashcards",
+    description:
+      "Run every question of a dashboard (or one tab) the way the dashboard runs it, applying its filter mappings, and report per card ok | empty | error with row counts. Use it to verify a dashboard before sharing it, with no filters and with filter values (values: {filter_id: value}; string filters take a string or a list, date filters a string such as '2026-12'). Cards with hide_empty: true are expected to be empty sometimes. Runs at most 3 queries at a time.",
+    metadata: { isRead: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      tab: z.union([z.number(), z.string()]).optional().describe("Only this tab: its id or name"),
+      values: z.record(z.unknown()).optional().describe("Filter values by filter id; filters not given are left empty"),
+    }).strict(),
+    execute: async (args: { dashboard_id: number; tab?: number | string; values?: Record<string, unknown> }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.runDashcards(args.dashboard_id, { tab: args.tab, values: args.values });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to run the cards of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
+  server.addTool({
     name: "set_dashboard_filters",
     description:
       "Set a dashboard's filters and connect them to the {{variables}} of its native SQL cards in one call. parameters is the FULL filter list (e.g. {id:'f_mes', name:'Mes', slug:'mes', type:'date/month-year', sectionId:'date'}; for a fixed list add values_source_type:'static-list', values_source_config:{values:[...]}). map_by_tag says which variable each filter feeds ({f_mes:'p_mes'}): every native card with that variable gets the mapping, unless listed in exclude. Filter and variable types must match (date/* → date, string/* → text, number/* → number). Mappings of other filters are kept. Use dry_run: true to preview. Reports per card what got mapped and which filters do not apply.",

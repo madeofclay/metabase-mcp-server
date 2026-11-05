@@ -74,7 +74,7 @@ export function tagObject(tags: TemplateTag[]): Record<string, TemplateTag> {
  */
 export function buildTemplateTags(
   sql: string,
-  cardKey: number | 'new',
+  cardKey: number | string,
   overrides: Record<string, TagOverride> = {},
   existing: TemplateTag[] = [],
 ): TemplateTag[] {

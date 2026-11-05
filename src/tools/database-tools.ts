@@ -381,6 +381,43 @@ export function addDatabaseTools(server: any, getClient: (ctx?: any) => Metabase
     },
   });
 
+  server.addTool({
+    name: "test_native_query",
+    description:
+      "Try a native SQL query with {{variables}} without saving it, sending values the way a dashboard filter would. template_tags sets variable types (date | text | number, default text); values gives a value per variable; filter_types says which dashboard filter type sends it (e.g. {p_mes: 'date/month-year', p_tier: 'string/='}). Optional [[ ]] clauses without a value drop out. For MongoDB pass collection and the pipeline as query. Returns columns, the first rows, row_count, the SQL as Metabase ran it, or the error.",
+    metadata: { isRead: true, isEssential: true },
+    parameters: z.object({
+      database_id: z.number().describe("The ID of the database"),
+      sql: z.string().describe("The SQL (or, for MongoDB, the pipeline as a JSON string)"),
+      template_tags: z
+        .record(z.object({
+          type: z.enum(["date", "text", "number"]).optional(),
+          display_name: z.string().optional(),
+        }).strict())
+        .optional()
+        .describe("Variable types by name; not listed = text"),
+      values: z.record(z.unknown()).optional().describe("Value per variable name"),
+      filter_types: z.record(z.string()).optional().describe("Dashboard filter type that sends each variable's value"),
+      collection: z.string().optional().describe("MongoDB only: the collection"),
+      limit_rows: z.number().optional().describe("Rows to return (default 20)"),
+    }).strict(),
+    execute: async (args: any, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.testNativeQuery(args.database_id, args.sql, {
+          templateTags: args.template_tags,
+          values: args.values,
+          filterTypes: args.filter_types,
+          collection: args.collection,
+          limitRows: args.limit_rows,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(`Failed to test the query on database ${args.database_id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    },
+  });
+
   /**
    * Trigger database schema synchronization
    * 
