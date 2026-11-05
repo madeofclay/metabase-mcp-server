@@ -147,7 +147,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "get_dashboard_revisions",
     description:
       "Retrieve revision history for a Metabase dashboard - use this to track dashboard evolution, review past changes, or restore previous versions",
-    metadata: { isRead: true },
+    metadata: { isEssential: true, isRead: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
     }).strict(),
@@ -485,7 +485,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "add_text_block",
     description:
       "Add a text block or heading to a dashboard - use this for explanatory text, titles, or instructions",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       text: z.string().describe("The text content (supports Markdown)"),
@@ -600,7 +600,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "revert_dashboard",
     description:
       "Restore a dashboard to a specific previous revision - use this to undo changes, restore deleted content, or return to known good configuration",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       revision_id: z.number().describe("The revision ID to revert to"),
@@ -720,7 +720,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "update_dashboard",
     description:
       "Update dashboard properties including name, description, parameters, and settings - use this to maintain metadata, reorganize content, or configure sharing",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard to update"),
       name: z.string().optional().describe("New name for the dashboard"),
@@ -808,7 +808,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
         .array(
           z
             .object({
-              id: z.number().describe("Card ID"),
+              id: z.number().describe("Dashcard ID (the id inside the dashboard's dashcards, not card_id); negative for a new dashcard"),
               size_x: z.number().optional().describe("Width of the card"),
               size_y: z.number().optional().describe("Height of the card"),
               row: z.number().optional().describe("Row position"),
@@ -1110,7 +1110,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "update_dashcard",
     description:
       "Update a specific dashcard's properties without affecting other cards - use for parameter_mappings, visualization_settings, position, or size changes. Much safer than update_dashboard_cards.",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       dashcard_id: z.number().describe("The dashcard 'id' field (not card_id)"),
