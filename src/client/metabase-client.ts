@@ -633,17 +633,25 @@ export class MetabaseClient {
     return response.data;
   }
 
+  /**
+   * Runs a native query. For a MongoDB database, `query` is the aggregation
+   * pipeline as a JSON string and `collection` names the collection it runs on:
+   * Metabase rejects a Mongo native query without it.
+   */
   async executeQuery(
     databaseId: number,
     query: string,
-    parameters: any[] = []
+    parameters: any[] = [],
+    collection?: string
   ): Promise<QueryResult> {
+    const native: Record<string, unknown> = {
+      query: query,
+      template_tags: {},
+    };
+    if (collection) native.collection = collection;
     const queryData = {
       type: "native",
-      native: {
-        query: query,
-        template_tags: {},
-      },
+      native,
       parameters: parameters,
       database: databaseId,
     };

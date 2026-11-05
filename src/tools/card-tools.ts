@@ -87,7 +87,8 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
     parameters: z.object({
       name: z.string().describe("Card name"),
       database_id: z.number().describe("Database ID to run the query against"),
-      query: z.string().describe("Native SQL query string (e.g. 'SELECT * FROM orders LIMIT 10')"),
+      query: z.string().describe("Native SQL query string (e.g. 'SELECT * FROM orders LIMIT 10'), or for MongoDB the aggregation pipeline as a JSON string"),
+      collection: z.string().optional().describe("MongoDB only, and required there: the collection the pipeline runs on"),
       description: z.string().optional().describe("Card description"),
       collection_id: z.number().optional().describe("Collection ID to save the card in"),
       display: z.string().optional().describe("Visualization type: table, bar, line, pie, scalar, etc. Defaults to 'table'"),
@@ -105,7 +106,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
           dataset_query: {
             database: args.database_id,
             type: "native",
-            native: { query: args.query },
+            native: args.collection ? { query: args.query, collection: args.collection } : { query: args.query },
           },
           display: args.display || "table",
           visualization_settings: args.visualization_settings || {},

@@ -358,21 +358,22 @@ export function addDatabaseTools(server: any, getClient: (ctx?: any) => Metabase
    */
   server.addTool({
     name: "execute_query",
-    description: "Execute a native SQL query against a Metabase database - use this for custom data analysis, complex queries, or extracting specific data not available through existing cards",
+    description: "Execute a native query against a Metabase database - use this for custom data analysis, complex queries, or extracting specific data not available through existing cards. For SQL databases, query is SQL. For MongoDB databases, query is the aggregation pipeline as a JSON string (e.g. '[{\"$match\":{\"status\":\"open\"}},{\"$limit\":10}]') and collection is required",
     metadata: { isEssential: true},
     parameters: z.object({
       database_id: z.number().describe("The ID of the database to query against"),
-      query: z.string().describe("The SQL query to execute"),
+      query: z.string().describe("The SQL query, or for MongoDB the aggregation pipeline as a JSON string"),
+      collection: z.string().optional().describe("MongoDB only, and required there: the collection the pipeline runs on"),
       parameters: z.array(z.object({
         type: z.string().optional().describe("Parameter type (e.g. 'category', 'date')"),
         target: z.array(z.unknown()).optional().describe("Target specification"),
         value: z.unknown().describe("Parameter value"),
       }).passthrough()).optional().describe("Optional query parameters for parameterized queries"),
     }).strict(),
-    execute: async (args: { database_id: number; query: string; parameters?: any[] }, context: any) => {
+    execute: async (args: { database_id: number; query: string; collection?: string; parameters?: any[] }, context: any) => {
       const metabaseClient = getClient(context);
       try {
-        const result = await metabaseClient.executeQuery(args.database_id, args.query, args.parameters || []);
+        const result = await metabaseClient.executeQuery(args.database_id, args.query, args.parameters || [], args.collection);
         return JSON.stringify(result, null, 2);
       } catch (error) {
         throw new Error(`Failed to execute query on database ${args.database_id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
