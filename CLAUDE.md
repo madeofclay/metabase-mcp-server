@@ -114,9 +114,9 @@ destructivas y su anotación lo dice. El interruptor lo lee `isDestructiveAllowe
   guarda los valores como «últimos filtros usados» del usuario: probar un mes futuro dejaba
   el dashboard real vacío para esa persona. Además valida el gráfico contra las columnas del
   resultado (`chart_error`: tendencia sin columna de fecha, `graph.metrics` que no existe,
-  etc.). No mira el dibujo: para eso está `preview_card`.
-- `preview_card` devuelve la tarjeta como PNG (`GET /api/pulse/preview_card_png/:id`, el
-  render estático de las suscripciones), con los valores por defecto de la pregunta.
+  etc.). No mira el dibujo: Metabase 0.63 no tiene API para renderizar una tarjeta como
+  imagen (`GET /api/pulse/preview_card_png/:id` existió hasta 0.50 y ya no está); las
+  tarjetas dudosas se miran en el navegador.
 - `create_card` y `update_card` responden un resumen con columnas, template tags y
   `chart_errors`/`chart_warnings` sobre `result_metadata` (`include_full` para todo).
 - `update_dashcard` **combina** `visualization_settings` (y `column_settings` por columna);

@@ -112,7 +112,7 @@ describe('runDashcards', () => {
     expect(card.status).toBe('chart_error');
     expect(card.chart_errors[0]).toMatch(/trend card needs a date column/);
     expect(result.totals.chart_errors).toBe(1);
-    expect(result.checks).toMatch(/preview_card/);
+    expect(result.checks).toMatch(/not inspected/);
   });
 
   it('runs one tab, by name or id', async () => {

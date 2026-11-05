@@ -1011,7 +1011,7 @@ export class MetabaseClient {
       dashboard_id: dashboardId,
       values,
       totals,
-      checks: 'Each query runs and its result fits the chart settings. The rendered chart itself is not inspected: use preview_card to see it. Nothing is saved as the user\'s filter values.',
+      checks: 'Each query runs and its result fits the chart settings. The drawn chart is not inspected (Metabase 0.63 has no API to render a card as an image): look at doubtful cards in the browser. Nothing is saved as the user\'s filter values.',
       cards: results,
     };
   }
@@ -1238,25 +1238,6 @@ export class MetabaseClient {
     } else {
       await this.axiosInstance.put(`/api/card/${id}`, { archived: true });
     }
-  }
-
-  /**
-   * The card rendered as a PNG by Metabase's static renderer, the one it uses
-   * for dashboard subscriptions (GET /api/pulse/preview_card_png/:id). It runs
-   * the saved question with its defaults, so dashboard filters and dashcard
-   * overrides do not apply. A chart that cannot be drawn fails here too.
-   */
-  async previewCardPng(id: number): Promise<{ base64: string; bytes: number }> {
-    const response = await this.axiosInstance.get(`/api/pulse/preview_card_png/${id}`, {
-      responseType: 'arraybuffer',
-    });
-    const buf = Buffer.from(response.data);
-    const type = String(response.headers?.['content-type'] || '');
-    if (!type.includes('image/png')) {
-      const text = buf.toString('utf8').slice(0, 300);
-      throw new Error(`Metabase did not return an image for card ${id} (${type || 'no content type'}): ${text}`);
-    }
-    return { base64: buf.toString('base64'), bytes: buf.length };
   }
 
   async executeCard(id: number, options: { ignore_cache?: boolean; collection_preview?: boolean; dashboard_id?: number } = {}): Promise<QueryResult> {

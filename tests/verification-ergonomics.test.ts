@@ -3,7 +3,6 @@ import { AxiosError } from 'axios';
 import { validateVisualization, effectiveSettings } from '../src/utils/viz-validation.js';
 import { cardSummary, cardOutput, dashboardOutput } from '../src/utils/compact-result.js';
 import { MetabaseClient, createdDashcardIds } from '../src/client/metabase-client.js';
-import { addCardTools } from '../src/tools/card-tools.js';
 
 const col = (name: string, base_type: string) => ({ name, base_type });
 const MES = col('Mes', 'type/Date');
@@ -187,26 +186,5 @@ describe('other 4xx errors say what Metabase answered', () => {
     await expect(client.getCard(7)).rejects.toThrow(
       /Request failed with status code 400 \(GET \/api\/card\/7\)\. Metabase said: "Invalid parameter value for p_mes"/
     );
-  });
-});
-
-describe('preview_card', () => {
-  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
-
-  it('returns the PNG as image content', async () => {
-    const client = clientAnswering((cfg) => {
-      expect(cfg.url).toBe('/api/pulse/preview_card_png/6615');
-      return { status: 200, data: PNG, headers: { 'content-type': 'image/png' } };
-    });
-    const tools: Record<string, any> = {};
-    addCardTools({ addTool: (t: any) => { tools[t.name] = t; } }, () => client);
-    const out = await tools.preview_card.execute({ card_id: 6615 }, {});
-    expect(out.content[1]).toEqual({ type: 'image', data: PNG.toString('base64'), mimeType: 'image/png' });
-    expect(out.content[0].text).toMatch(/Card 6615 rendered/);
-  });
-
-  it('says so when Metabase answers something that is not an image', async () => {
-    const client = clientAnswering(() => ({ status: 200, data: Buffer.from('<html>error</html>'), headers: { 'content-type': 'text/html' } }));
-    await expect(client.previewCardPng(1)).rejects.toThrow(/did not return an image for card 1 \(text\/html\)/);
   });
 });

@@ -11,7 +11,8 @@
  *
  * Errors mean the chart will not render; warnings mean a setting points at a
  * column that is not there (the chart may still draw, without it). This does not
- * replace looking at the card: preview_card renders it.
+ * replace looking at the card in the browser: Metabase 0.63 has no API that
+ * renders a card as an image (GET /api/pulse/preview_card_png existed up to 0.50).
  */
 
 export interface Column {
