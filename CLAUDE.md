@@ -91,6 +91,22 @@ están en escritura; pero sin `--allow-destructive` rechazan (antes de escribir,
 destructivas y su anotación lo dice. El interruptor lo lee `isDestructiveAllowed()`
 (`src/utils/tool-filters.ts`), que `server.ts` fija al arrancar.
 
+## Respuestas y errores
+
+- Las tools que escriben un dashboard (`put_dashboard_layout`, `set_dashboard_filters`,
+  `manage_dashboard_tabs`, `add_card_to_dashboard`, `add_text_block`, `update_dashcard`,
+  `update_dashboard_cards`, `remove_cards_from_dashboard`) devuelven un **resumen**: id,
+  nombre, pestañas con su número de tarjetas, cuántas tarjetas, filtros y mappings, más
+  `diff`, `previous_revision_id` y, en `dry_run`, una línea por tarjeta. El dashboard
+  completo que manda Metabase (110k-160k caracteres con 24 tarjetas, más de lo que un
+  cliente como Claude acepta en un resultado) sólo con `include_dashboard: true`.
+  `src/utils/compact-result.ts`.
+- Un 401 o 403 de Metabase ya no llega como «Request failed with status code 403»: el
+  interceptor de `MetabaseClient` lo reescribe con el recurso (`card 6537`, `database 40`,
+  `a query on database 40`), el email del usuario conectado (403; se consulta una vez
+  por cliente en `/api/user/current`), el detalle que mandó Metabase y qué hacer
+  (reconectar en un 401, pedir acceso a un admin en un 403). `src/utils/metabase-errors.ts`.
+
 ## Gotchas de Metabase 0.63
 
 Verificados contra analytics.clay.cl (dashboard 621 y su copia de prueba 622):
@@ -145,6 +161,8 @@ src/
     tool-filters.ts       # modo (--essential/--read/--write/--all) y --allow-destructive, o sus variables
     template-tags.ts      # {{variables}} del SQL nativo -> template tags (MBQL 5 y legacy)
     tool-annotations.ts   # grupo de cada tool (lectura, escritura, destructiva) -> anotaciones MCP
+    compact-result.ts     # resumen de las respuestas de las tools que escriben un dashboard
+    metabase-errors.ts    # mensajes explícitos para 401/403 (recurso, usuario, qué hacer)
   types/                  # tipos de config y errores
 docs/spec-google-sso-auth.md  # spec (no implementada del todo) para soportar sesión de Google SSO
 Dockerfile / docker-compose.yml / docker-run.sh  # empaquetado para self-host vía Docker
