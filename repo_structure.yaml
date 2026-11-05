@@ -35,7 +35,7 @@ entrypoints:
     environments: [prod, develop]
     custom_domain: ~
   - type: oauth-gateway
-    description: "Gateway Express (src/oauth-gateway.ts) que implementa Authorization Code + PKCE para clientes OAuth (Claude.ai) y proxea a http-stream. Corre en ai-agents-dev, puerto 8012, publicado por nginx. Con GOOGLE_CLIENT_ID/SECRET hace el login de Google en el servidor (src/google-sso.ts) y renueva la sesión de Metabase en cada refresh."
+    description: "Gateway Express (src/oauth-gateway.ts) que implementa Authorization Code + PKCE para clientes OAuth (Claude.ai) y proxea a http-stream. Corre en ai-agents-dev, puerto 8012, publicado por nginx. Con GOOGLE_CLIENT_ID/SECRET hace el login de Google en el servidor (src/google-sso.ts) y renueva la sesión de Metabase en cada refresh. Guarda los grants (credenciales cifradas) en un archivo local (GRANT_STORE_PATH) y expone /oauth/revoke (RFC 7009)."
     environments: [develop]
     custom_domain: data-dev.clay.cl
 
@@ -62,4 +62,4 @@ agent_notes:
   - "El repo es un fork del proyecto open-source CognitionAI/metabase-mcp-server (remote 'upstream' presente tras el clone). El README, package.json (scope @cognitionai) y la mayoría del código son idénticos al upstream; la única personalización visible de Clay es el gateway OAuth (src/oauth-gateway.ts, agregado en commits recientes de la rama main de madeofclay) con el default 'https://analytics.clay.cl/' en el formulario de autorización."
   - "Si Clay efectivamente corre este servidor en producción (ej. como contenedor Docker en alguna instancia/servicio para exponer el gateway OAuth a Claude.ai), la infraestructura que lo aloja vive fuera de este repositorio (otro repo de infra, o desplegado manualmente) — recomendar confirmarlo con el equipo dueño antes de asumir 'sin infraestructura'."
   - "Dockerfile tiene un mismatch: CMD ejecuta 'node dist/index.js', pero el build (npm run build) y package.json.main apuntan a 'dist/server.js' / 'build/server.js' — el contenedor tal como está definido probablemente falla al arrancar. No se corrigió (fuera de alcance de este levantamiento de documentación)."
-  - "No hay bases de datos, colas SQS/SNS, buckets S3, ni tablas DynamoDB propias de este repo — toda la 'persistencia' vive dentro de la instancia Metabase externa (fuera del alcance de este repo) y, en el gateway OAuth, un Map en memoria de códigos de autorización pendientes (TTL 10 min, se pierde al reiniciar el proceso)."
+  - "No hay bases de datos, colas SQS/SNS, buckets S3, ni tablas DynamoDB propias de este repo — toda la 'persistencia' vive dentro de la instancia Metabase externa (fuera del alcance de este repo) y, en el gateway OAuth, un archivo local de grants (GRANT_STORE_PATH, credenciales cifradas con AES-256-GCM) más un Map en memoria de códigos de autorización pendientes (TTL 10 min)."

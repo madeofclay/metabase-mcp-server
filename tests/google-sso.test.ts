@@ -8,11 +8,15 @@ process.env.GATEWAY_URL = 'https://mcp.example.com';
 process.env.MCP_UPSTREAM = 'http://localhost:9999';
 process.env.GOOGLE_CLIENT_ID = 'metabase-client.apps.googleusercontent.com';
 process.env.GOOGLE_CLIENT_SECRET = 'google-client-secret';
+process.env.GRANT_STORE_PATH = ':memory:';
+process.env.ALLOWED_REDIRECT_HOSTS = 'client.example.com';
 
 // ── Fake Google and Metabase ─────────────────────────────────────────────────
 
 const METABASE = 'https://metabase.example.com';
 const CLIENT_REDIRECT = 'https://client.example.com/callback';
+const VERIFIER  = 'test-verifier-string';
+const CHALLENGE = 'LHKy4-q59ocwlltGr-0vD9UbiHBsIU09drZuupn1ghs';
 
 const fake = {
   googleRefreshFails: '' as '' | 'invalid_grant' | 'server_error',
@@ -44,6 +48,10 @@ const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
     if (fake.googleRefreshFails === 'server_error') return json(503, { error: 'server_error' });
     return json(200, { id_token: idToken('google-user-1') });
   }
+  if (url === 'https://oauth2.googleapis.com/revoke') {
+    fake.calls.push(`google:revoke:${new URLSearchParams(String(init?.body)).get('token')}`);
+    return new Response(null, { status: 200 });
+  }
   if (url === `${METABASE}/api/session/google_auth`) {
     fake.calls.push('metabase:google_auth');
     if (fake.metabaseRejectsGoogle) return json(401, { message: 'no user' });
@@ -66,13 +74,14 @@ const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
 });
 vi.stubGlobal('fetch', fetchMock);
 
-const { app } = await import('../src/oauth-gateway.js');
+const { app, grants, startGrant } = await import('../src/oauth-gateway.js');
 const { CredentialSealer } = await import('../src/credentials.js');
 const sealer = new CredentialSealer('test-secret-for-vitest');
 
 function decode(token: string): Record<string, any> {
   const claims = jwt.verify(token, 'test-secret-for-vitest') as Record<string, any>;
-  return claims.cred ? { ...claims, ...sealer.open(claims.cred) } : claims;
+  const grant = grants.get(claims.gid);
+  return grant && !grant.revoked_at ? { ...claims, ...grants.credentials(grant) } : claims;
 }
 
 beforeEach(() => {
@@ -89,6 +98,8 @@ async function startFlow() {
   const res = await request(app).get('/oauth/google/start').query({
     redirect_uri: CLIENT_REDIRECT,
     state: 'client-state',
+    code_challenge: CHALLENGE,
+    code_challenge_method: 'S256',
     metabase_url: METABASE,
   });
   const google = new URL(res.headers['location'] as string);
@@ -103,16 +114,14 @@ async function signIn() {
   const token = await request(app).post('/oauth/token').send({
     grant_type: 'authorization_code',
     code: back.searchParams.get('code'),
+    code_verifier: VERIFIER,
   });
   return token.body;
 }
 
+// A connection with these credentials, as the code exchange would record it.
 function refreshTokenFor(creds: Record<string, any>): string {
-  return jwt.sign(
-    { metabase_url: creds.metabase_url, cred: sealer.seal(creds as any), sub: 'test', typ: 'refresh' },
-    'test-secret-for-vitest',
-    { expiresIn: '30d' },
-  );
+  return startGrant(creds as any).body.refresh_token;
 }
 
 const refresh = (refresh_token: string) =>
@@ -124,7 +133,7 @@ const now = () => Math.floor(Date.now() / 1000);
 
 describe('server-side Google sign-in', () => {
   it('sends the authorize page through the gateway instead of Google’s in-page sign-in', async () => {
-    const res = await request(app).get('/oauth/authorize?redirect_uri=https://client.example.com/cb');
+    const res = await request(app).get('/oauth/authorize').query({ redirect_uri: 'https://client.example.com/cb', code_challenge: CHALLENGE, code_challenge_method: 'S256' });
     expect(res.text).toContain('var GOOGLE_SERVER_FLOW = true;');
   });
 
@@ -225,7 +234,7 @@ describe('Metabase session renewal on refresh', () => {
     const creds = decode(res.body.access_token);
     expect(creds.metabase_session_token).not.toBe('session-old');
     expect(creds.metabase_session_issued_at).toBeGreaterThan(now() - 60);
-    expect(res.body.expires_in).toBe(8 * 3600);
+    expect(res.body.expires_in).toBe(3600);
   });
 
   it('renews a session once it is a day old, without waiting for it to fail', async () => {
@@ -263,9 +272,12 @@ describe('Metabase session renewal on refresh', () => {
   it('asks the user to sign in again when Google revoked the grant', async () => {
     fake.deadSessions.add('session-old');
     fake.googleRefreshFails = 'invalid_grant';
-    const res = await refresh(refreshTokenFor(googleCreds()));
+    const token = refreshTokenFor(googleCreds());
+    const res = await refresh(token);
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('invalid_grant');
+    // The grant is over, so its tokens stop working everywhere.
+    expect((await refresh(token)).body.error_description).toBe('Refresh token revoked');
   });
 
   it('retries soon, instead of disconnecting, when Google is unreachable', async () => {
@@ -280,7 +292,7 @@ describe('Metabase session renewal on refresh', () => {
     fake.googleRefreshFails = 'server_error';
     const res = await refresh(refreshTokenFor(googleCreds({ metabase_session_issued_at: now() - 13 * 86400 })));
     expect(res.status).toBe(200);
-    expect(res.body.expires_in).toBe(8 * 3600);
+    expect(res.body.expires_in).toBe(3600);
     expect(decode(res.body.access_token).metabase_session_token).toBe('session-old');
   });
 
@@ -297,28 +309,63 @@ describe('Metabase session renewal on refresh', () => {
     expect(fake.calls).toEqual([]);
   });
 
-  it('still refreshes a token issued before credentials were sealed', async () => {
+  it('refuses a token from before grants existed, which carried the credentials itself', async () => {
     const legacy = jwt.sign(
-      { metabase_url: METABASE, metabase_api_key: 'mb_legacy', typ: 'refresh' },
+      { metabase_url: METABASE, cred: sealer.seal({ metabase_url: METABASE, metabase_api_key: 'mb_legacy' }), typ: 'refresh' },
       'test-secret-for-vitest',
       { expiresIn: '30d' },
     );
     const res = await refresh(legacy);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_grant');
+  });
+});
+
+// ── Revoking a Google connection ─────────────────────────────────────────────
+
+describe('revoking a Google connection', () => {
+  it('ends its Metabase session and its Google permission', async () => {
+    const body = await signIn();
+    const { metabase_session_token } = decode(body.access_token);
+    fake.calls = [];
+    const res = await request(app).post('/oauth/revoke').send({ token: body.refresh_token });
     expect(res.status).toBe(200);
-    expect(decode(res.body.access_token).metabase_api_key).toBe('mb_legacy');
+    expect(fake.calls).toContain(`metabase:logout:${metabase_session_token}`);
+    expect(fake.calls).toContain('google:revoke:g-refresh-1');
+  });
+
+  it('does the same when a stolen refresh token is replayed', async () => {
+    const body = await signIn();
+    await refresh(body.refresh_token);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 31_000);
+    try {
+      fake.calls = [];
+      const replay = await refresh(body.refresh_token);
+      expect(replay.status).toBe(400);
+      expect(fake.calls).toContain('google:revoke:g-refresh-1');
+      expect(fake.calls.some((c) => c.startsWith('metabase:logout:'))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the renewed session, not the first one, in the grant', async () => {
+    const body = await signIn();
+    const first = decode(body.access_token).metabase_session_token;
+    fake.deadSessions.add(first);
+    const res = await refresh(body.refresh_token);
+    // The access token issued before the renewal now sees the new session too.
+    expect(decode(body.access_token).metabase_session_token).not.toBe(first);
+    expect(decode(res.body.access_token).metabase_session_token).toBe(decode(body.access_token).metabase_session_token);
   });
 });
 
 describe('sealed credentials', () => {
-  it('rejects a token whose sealed credentials were tampered with', async () => {
-    const token = jwt.sign(
-      { metabase_url: METABASE, cred: 'v1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', typ: 'access', aud: 'https://mcp.example.com/mcp' },
-      'test-secret-for-vitest',
-      { expiresIn: '8h' },
-    );
-    const res = await request(app).post('/mcp').set('Authorization', `Bearer ${token}`)
-      .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
-    expect(res.status).toBe(401);
+  it('cannot be opened under another grant id', () => {
+    const sealed = sealer.seal({ metabase_url: METABASE, metabase_api_key: 'mb_x' }, 'grant-a');
+    expect(sealer.open(sealed, 'grant-a').metabase_api_key).toBe('mb_x');
+    expect(() => sealer.open(sealed, 'grant-b')).toThrow();
   });
 
   it('cannot be opened with another secret', () => {

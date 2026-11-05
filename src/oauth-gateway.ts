@@ -9,19 +9,30 @@
  *   1. Claude.ai discovers /oauth/authorize via /.well-known/oauth-authorization-server
  *   2. Claude.ai redirects user to /oauth/authorize  →  HTML form (Metabase URL + key)
  *   3. User submits  →  server stores creds under a temp code  →  redirect back to client
- *   4. Claude.ai POSTs /oauth/token with code  →  server returns access + refresh JWT
+ *   4. Claude.ai POSTs /oauth/token with code + PKCE verifier  →  the gateway
+ *      records a grant (credentials sealed, src/grant-store.ts) and returns an
+ *      access + refresh JWT that only point at it
  *   5. Claude.ai calls /mcp with  Authorization: Bearer <JWT>
- *   6. Gateway validates JWT, injects x-metabase-* headers, proxies to FastMCP
+ *   6. Gateway validates JWT and its grant, injects x-metabase-* headers, proxies to FastMCP
  *   7. When the access token expires, Claude.ai POSTs /oauth/token with
- *      grant_type=refresh_token  →  server returns a fresh pair (rotation)
+ *      grant_type=refresh_token  →  server returns a fresh pair (rotation; reusing
+ *      a replaced refresh token revokes the grant)
+ *   8. POST /oauth/revoke (RFC 7009) ends a grant, its Metabase session and its
+ *      Google permission
  *
  * Environment variables:
  *   GATEWAY_URL            Public base URL of this gateway  (e.g. https://mcp.example.com)
  *   GATEWAY_PORT           Port to listen on                (default: 8080)
  *   MCP_UPSTREAM           FastMCP HTTP Stream URL          (default: http://localhost:8011)
  *   JWT_SECRET             Secret for signing tokens        (required — env var or vault)
- *   TOKEN_EXPIRY           Access token expiry              (default: 8h)
- *   REFRESH_TOKEN_EXPIRY   Refresh token expiry             (default: 30d)
+ *   TOKEN_EXPIRY           Access token expiry              (default: 1h)
+ *   REFRESH_TOKEN_EXPIRY   Refresh token expiry; a connection unused this long
+ *                          must sign in again               (default: 7d)
+ *   GRANT_MAX_AGE          Absolute life of a connection, however often it is
+ *                          refreshed                        (default: 30d)
+ *   GRANT_STORE_PATH       Grant store file, or :memory:    (default: ./data/grants.json)
+ *   ALLOWED_REDIRECT_HOSTS Hosts a client may receive codes on, over https
+ *                          (default: claude.ai,claude.com; loopback http is always allowed)
  *   MCP_RESOURCE_URI       Public URI of the MCP endpoint   (default: GATEWAY_URL/mcp)
  *                          Set this when a proxy exposes /mcp under a path prefix.
  *
@@ -41,8 +52,10 @@ import http from 'http';
 import { URL } from 'url';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import path from 'path';
 import { hydrateEnvFromVault, vaultName } from './utils/secrets.js';
-import { Credentials, CredentialSealer, credentialsFromPayload, pickCredentials } from './credentials.js';
+import { Credentials, CredentialSealer, pickCredentials } from './credentials.js';
+import { Grant, GrantStore } from './grant-store.js';
 import {
   GoogleConfig,
   GoogleGrantRejected,
@@ -53,6 +66,7 @@ import {
   metabaseSessionAlive,
   metabaseSessionFromGoogle,
   refreshGoogleIdToken,
+  revokeGoogleToken,
 } from './google-sso.js';
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
@@ -72,8 +86,39 @@ app.use(express.urlencoded({ extended: true }));
 const GATEWAY_URL  = (process.env.GATEWAY_URL  || 'http://localhost:8080').replace(/\/$/, '');
 const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || '8080');
 const MCP_UPSTREAM = (process.env.MCP_UPSTREAM  || 'http://localhost:8011').replace(/\/$/, '');
-const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY   || '8h';
-const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || '30d';
+/** '90', '90s', '15m', '8h' or '30d' in seconds. */
+function durationS(value: string, name: string): number {
+  const m = /^(\d+)\s*([smhd]?)$/.exec(value.trim());
+  if (!m) throw new Error(`${name} must look like 90s, 15m, 8h or 30d (got "${value}")`);
+  return parseInt(m[1]) * ({ '': 1, s: 1, m: 60, h: 3600, d: 86400 } as Record<string, number>)[m[2]];
+}
+
+// Short access tokens, a refresh token that dies when the connection sits idle,
+// and an absolute end to every connection (RFC 9700 §2.2.2, §4.14.2).
+const TOKEN_EXPIRY_S         = durationS(process.env.TOKEN_EXPIRY || '1h', 'TOKEN_EXPIRY');
+const REFRESH_TOKEN_EXPIRY_S = durationS(process.env.REFRESH_TOKEN_EXPIRY || '7d', 'REFRESH_TOKEN_EXPIRY');
+const GRANT_MAX_AGE_S        = durationS(process.env.GRANT_MAX_AGE || '30d', 'GRANT_MAX_AGE');
+
+// How long a replaced refresh token is still honoured, for a client that lost
+// the response to its refresh and retries. Past this, its reuse means the token
+// was copied, and the grant is revoked.
+const REFRESH_REUSE_GRACE_S = 30;
+
+// Codes are only ever sent to these hosts (over https) or to a loopback address.
+// Without this, a crafted authorize link could have someone sign in and deliver
+// their code to whoever wrote the link; PKCE does not help, since that person
+// would hold the verifier. Dynamic registration is open, so it cannot be the check.
+const ALLOWED_REDIRECT_HOSTS = (process.env.ALLOWED_REDIRECT_HOSTS || 'claude.ai,claude.com')
+  .split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+
+function redirectAllowed(uri: string | undefined): boolean {
+  if (!uri) return false;
+  let u: URL;
+  try { u = new URL(uri); } catch { return false; }
+  if (u.username || u.password || u.hash) return false;
+  if (u.protocol === 'https:') return ALLOWED_REDIRECT_HOSTS.includes(u.hostname.toLowerCase());
+  return u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+}
 
 // Canonical URI of the MCP server this gateway protects (RFC 8707 / RFC 9728).
 // Access tokens are bound to it so a token minted for another resource cannot be
@@ -99,6 +144,14 @@ const JWT_SECRET = process.env.JWT_SECRET;
 log('info', `JWT_SECRET loaded from ${secretOrigin.JWT_SECRET}`);
 
 const sealer = new CredentialSealer(JWT_SECRET);
+
+const GRANT_STORE_PATH = process.env.GRANT_STORE_PATH || path.resolve('data', 'grants.json');
+const grants = new GrantStore(GRANT_STORE_PATH, JWT_SECRET, sealer, log);
+setInterval(() => grants.purge(), 60 * 60 * 1000).unref();
+
+// Pinned, so a token can never pick its own algorithm.
+const SIGN_OPTIONS = { algorithm: 'HS256', issuer: GATEWAY_URL } as const;
+const VERIFY_OPTIONS = { algorithms: ['HS256'], issuer: GATEWAY_URL } as jwt.VerifyOptions;
 
 // Server-side Google sign-in is on only when Metabase's Google client is fully
 // configured. Without it the authorize page keeps the browser-only Google flow,
@@ -130,7 +183,7 @@ const SESSION_RENEW_AFTER_S = Math.round(parseFloat(process.env.METABASE_SESSION
 // ── Pending authorization codes (in-memory, 10-min TTL) ─────────────────────
 
 type PendingCode = Credentials & {
-  code_challenge?: string;   // PKCE
+  code_challenge: string;    // PKCE (S256), always required
   redirect_uri: string;
   expires: number;
 };
@@ -142,7 +195,7 @@ setInterval(() => {
   for (const [code, data] of pendingCodes) {
     if (data.expires < now) pendingCodes.delete(code);
   }
-}, 5 * 60 * 1000);
+}, 5 * 60 * 1000).unref();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -163,11 +216,9 @@ function verifyPkce(verifier: string, challenge: string): boolean {
 }
 
 // ── Token issuance ───────────────────────────────────────────────────────────
-// The JWT carries the Metabase credentials, so it *is* the credential: there is
-// no server-side session to look up. Access tokens are therefore short-lived and
-// renewed through a rotating refresh token rather than simply given a long life.
-// The credentials travel sealed (src/credentials.ts): a JWT is only signed, and
-// anyone holding one could otherwise read the API key, password or session in it.
+// Tokens carry no credential, only the grant they belong to (`gid`): the
+// credentials stay in the grant store, sealed. So a leaked token reveals nothing,
+// and revoking the grant cuts every token of it at once.
 
 // Stable, non-reversible id for a connection so logs can correlate one user's
 // tokens across issuance, refresh and expiry without ever recording a credential.
@@ -184,19 +235,29 @@ function subjectOf(creds: Credentials): string {
   return crypto.createHash('sha256').update(material).digest('hex').slice(0, 12);
 }
 
-function issueTokens(creds: Credentials, accessExpiry: string = TOKEN_EXPIRY) {
-  const sub = subjectOf(creds);
-  // A unique jti per token: HMAC over an identical payload is deterministic, so
-  // without it two tokens minted in the same second are byte-identical and
-  // rotating the refresh token would hand back the very token it replaces.
-  const jti = () => crypto.randomBytes(16).toString('hex');
-  const claims = { metabase_url: creds.metabase_url, cred: sealer.seal(creds), sub };
-  const access  = jwt.sign({ ...claims, jti: jti(), typ: 'access', aud: RESOURCE_URI }, JWT_SECRET, { expiresIn: accessExpiry } as jwt.SignOptions);
-  const refresh = jwt.sign({ ...claims, jti: jti(), typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY } as jwt.SignOptions);
+// A unique jti per token: HMAC over an identical payload is deterministic, so
+// without it two tokens minted in the same second are byte-identical and
+// rotating the refresh token would hand back the very token it replaces.
+const newJti = () => crypto.randomBytes(16).toString('hex');
+
+function issueTokens(grant: Grant, refreshJti: string, accessExpiryS: number = TOKEN_EXPIRY_S) {
+  // No token outlives its grant.
+  const left = grant.expires_at - Math.floor(Date.now() / 1000);
+  const claims = { sub: grant.sub, gid: grant.id };
+  const access = jwt.sign(
+    { ...claims, jti: newJti(), typ: 'access', aud: RESOURCE_URI },
+    JWT_SECRET,
+    { ...SIGN_OPTIONS, expiresIn: Math.min(accessExpiryS, left) },
+  );
+  const refresh = jwt.sign(
+    { ...claims, jti: refreshJti, typ: 'refresh' },
+    JWT_SECRET,
+    { ...SIGN_OPTIONS, expiresIn: Math.min(REFRESH_TOKEN_EXPIRY_S, left) },
+  );
   const { iat, exp } = jwt.decode(access)  as { iat: number; exp: number };
   const refreshExp   = (jwt.decode(refresh) as { exp: number }).exp;
   return {
-    sub,
+    sub: grant.sub,
     body: {
       access_token: access,
       token_type: 'bearer',
@@ -205,6 +266,42 @@ function issueTokens(creds: Credentials, accessExpiry: string = TOKEN_EXPIRY) {
       refresh_expires_in: refreshExp - iat,
     },
   };
+}
+
+/** Records a new grant for these credentials and issues its first token pair. */
+function startGrant(creds: Credentials) {
+  const jti = newJti();
+  const grant = grants.create(creds, subjectOf(creds), GRANT_MAX_AGE_S, jti);
+  return issueTokens(grant, jti);
+}
+
+/**
+ * Revokes a grant and ends what it held upstream: the Metabase session, so a
+ * copy of it stops working, and the Google permission, so no new session can
+ * be minted from it. API keys and passwords belong to the user and stay as they are.
+ */
+async function revokeGrant(grant: Grant, reason: string) {
+  const creds = grants.revoke(grant, reason);
+  if (!creds) return;
+  const ended = creds.metabase_session_token
+    ? await metabaseLogout(creds.metabase_url, creds.metabase_session_token)
+    : undefined;
+  const googleRevoked = creds.google_refresh_token
+    ? await revokeGoogleToken(creds.google_refresh_token)
+    : undefined;
+  log('info', `grant revoked sub=${grant.sub} reason=${reason} metabase_session_ended=${ended ?? '-'} google_revoked=${googleRevoked ?? '-'}`);
+}
+
+// Refreshes of one grant run one at a time: two concurrent ones would both
+// rotate, and the loser's token would then look reused.
+const grantLocks = new Map<string, Promise<unknown>>();
+function withGrantLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const prev = grantLocks.get(id) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.catch(() => {});
+  grantLocks.set(id, tail);
+  tail.then(() => { if (grantLocks.get(id) === tail) grantLocks.delete(id); });
+  return run;
 }
 
 // ── Dynamic client registration (RFC 7591) ───────────────────────────────────
@@ -218,6 +315,11 @@ app.post('/oauth/register', (req: Request, res: Response) => {
   const { redirect_uris, client_name } = req.body;
   if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
     res.status(400).json({ error: 'invalid_client_metadata', error_description: 'redirect_uris required' });
+    return;
+  }
+  if (!redirect_uris.every((u: unknown) => typeof u === 'string' && redirectAllowed(u))) {
+    log('warn', 'client registration refused: redirect_uri not allowed');
+    res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uri not allowed' });
     return;
   }
   const client_id = crypto.randomBytes(16).toString('hex');
@@ -258,11 +360,13 @@ app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response
     issuer: GATEWAY_URL,
     authorization_endpoint: `${GATEWAY_URL}/oauth/authorize`,
     token_endpoint: `${GATEWAY_URL}/oauth/token`,
+    revocation_endpoint: `${GATEWAY_URL}/oauth/revoke`,
     registration_endpoint: `${GATEWAY_URL}/oauth/register`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
+    revocation_endpoint_auth_methods_supported: ['none'],
   });
 });
 
@@ -272,6 +376,7 @@ app.get('/.well-known/openid-configuration', (_req: Request, res: Response) => {
     issuer: GATEWAY_URL,
     authorization_endpoint: `${GATEWAY_URL}/oauth/authorize`,
     token_endpoint: `${GATEWAY_URL}/oauth/token`,
+    revocation_endpoint: `${GATEWAY_URL}/oauth/revoke`,
     registration_endpoint: `${GATEWAY_URL}/oauth/register`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
@@ -365,6 +470,16 @@ function nonceCookie(value: string, maxAge: number): string {
   return `${GOOGLE_NONCE_COOKIE}=${value}; Path=/oauth/google; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
 }
 
+/**
+ * Why an authorization request must be refused, or undefined. PKCE is required
+ * (OAuth 2.1): without it, a code intercepted on its way back is a token.
+ */
+function authorizeRequestProblem(redirect_uri?: string, code_challenge?: string, method?: string): string | undefined {
+  if (!redirectAllowed(redirect_uri)) return 'redirect_uri not allowed';
+  if (!code_challenge || method !== 'S256') return 'PKCE with code_challenge_method=S256 is required';
+  return undefined;
+}
+
 app.get('/oauth/google/start', (req: Request, res: Response) => {
   if (!GOOGLE) {
     res.status(404).send('Server-side Google sign-in is not configured');
@@ -373,6 +488,11 @@ app.get('/oauth/google/start', (req: Request, res: Response) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, metabase_url } = req.query as Record<string, string>;
   if (!redirect_uri || !metabase_url) {
     res.status(400).send('redirect_uri and metabase_url are required');
+    return;
+  }
+  const invalid = authorizeRequestProblem(redirect_uri, code_challenge, code_challenge_method);
+  if (invalid) {
+    res.status(400).send(invalid);
     return;
   }
 
@@ -395,7 +515,7 @@ app.get('/oauth/google/callback', async (req: Request, res: Response) => {
 
   let flow: Record<string, any>;
   try {
-    flow = jwt.verify(state || '', JWT_SECRET) as Record<string, any>;
+    flow = jwt.verify(state || '', JWT_SECRET, { algorithms: ['HS256'] }) as Record<string, any>;
     if (flow.typ !== 'google_state') throw new Error('wrong state type');
   } catch {
     htmlMessage(res, 400, 'La sesión de inicio expiró o no es válida. Vuelve a conectar desde Claude.');
@@ -432,7 +552,7 @@ app.get('/oauth/google/callback', async (req: Request, res: Response) => {
       metabase_session_issued_at: Math.floor(Date.now() / 1000),
       google_refresh_token: google.refreshToken,
       google_subject: google.subject,
-      code_challenge: flow.code_challenge_method === 'S256' ? flow.code_challenge : undefined,
+      code_challenge: flow.code_challenge,
       redirect_uri: flow.redirect_uri,
       expires: Date.now() + 10 * 60 * 1000,
     });
@@ -459,6 +579,11 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
 
   if (!redirect_uri) {
     res.status(400).send('Missing redirect_uri');
+    return;
+  }
+  const invalid = authorizeRequestProblem(redirect_uri, code_challenge, code_challenge_method);
+  if (invalid) {
+    res.status(400).send(invalid);
     return;
   }
 
@@ -763,6 +888,11 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     res.status(400).send('Metabase URL is required');
     return;
   }
+  const invalid = authorizeRequestProblem(redirect_uri, code_challenge, code_challenge_method);
+  if (invalid) {
+    res.status(400).send(invalid);
+    return;
+  }
 
   // A Metabase API key always starts with `mb_`. Anything else in this field is
   // not a key, and the most common source is a browser password manager filling
@@ -789,7 +919,7 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     metabase_password:      metabase_password      || undefined,
     metabase_session_token: metabase_session_token || undefined,
     metabase_session_issued_at: metabase_session_token ? Math.floor(Date.now() / 1000) : undefined,
-    code_challenge:         code_challenge_method === 'S256' ? code_challenge : undefined,
+    code_challenge,
     redirect_uri,
     expires: Date.now() + 10 * 60 * 1000,
   });
@@ -815,7 +945,7 @@ class SessionGone extends Error {}
 
 // Short access token when renewal failed for a transient reason, so the client
 // comes back soon to try again instead of holding a dead session for hours.
-const RETRY_ACCESS_EXPIRY = '5m';
+const RETRY_ACCESS_EXPIRY_S = 5 * 60;
 
 async function renewMetabaseSession(creds: Credentials, sub: string, reason: string): Promise<Credentials> {
   const google = await refreshGoogleIdToken(GOOGLE!, creds.google_refresh_token!);
@@ -878,7 +1008,8 @@ async function freshCredentials(creds: Credentials, sub: string): Promise<{ cred
 }
 
 // Refresh grant — the client trades a refresh token for a fresh pair. The refresh
-// token is rotated on every use so that a leaked one has a bounded life.
+// token is rotated on every use and only the newest one is honoured: presenting
+// a replaced one means someone else holds a copy, so the grant is revoked.
 async function handleRefresh(req: Request, res: Response) {
   const { refresh_token } = req.body as Record<string, string>;
 
@@ -887,53 +1018,77 @@ async function handleRefresh(req: Request, res: Response) {
     return;
   }
 
+  const reject = (reason: string, description: string, sub = '-') => {
+    log('info', `token refresh rejected reason=${reason} sub=${sub}`);
+    res.status(400).json({ error: 'invalid_grant', error_description: description });
+  };
+
   let payload: Record<string, any>;
   try {
-    payload = jwt.verify(refresh_token, JWT_SECRET) as Record<string, any>;
+    payload = jwt.verify(refresh_token, JWT_SECRET, VERIFY_OPTIONS) as Record<string, any>;
   } catch (err) {
     const expired = err instanceof jwt.TokenExpiredError;
-    log('info', `token refresh rejected reason=${expired ? 'expired' : 'invalid'}`);
-    res.status(400).json({
-      error: 'invalid_grant',
-      error_description: expired ? 'Refresh token expired' : 'Refresh token invalid',
-    });
+    reject(expired ? 'expired' : 'invalid', expired ? 'Refresh token expired' : 'Refresh token invalid');
     return;
   }
 
   // An access token must never be spendable as a refresh token.
   if (payload.typ !== 'refresh') {
-    log('info', `token refresh rejected reason=wrong_token_type sub=${payload.sub || '-'}`);
-    res.status(400).json({ error: 'invalid_grant', error_description: 'Not a refresh token' });
+    reject('wrong_token_type', 'Not a refresh token', payload.sub);
     return;
   }
 
-  let creds: Credentials;
-  try {
-    creds = credentialsFromPayload(payload, sealer);
-  } catch {
-    log('info', `token refresh rejected reason=unreadable_credentials sub=${payload.sub || '-'}`);
-    res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token invalid' });
+  const grant = grants.get(payload.gid);
+  if (!grant) {
+    reject('unknown_grant', 'Refresh token invalid', payload.sub);
     return;
   }
 
-  let fresh: { creds: Credentials; degraded: boolean };
-  try {
-    fresh = await freshCredentials(creds, payload.sub || subjectOf(creds));
-  } catch (err) {
-    if (err instanceof SessionGone) {
-      res.status(400).json({ error: 'invalid_grant', error_description: 'Metabase session expired; sign in again' });
+  await withGrantLock(grant.id, async () => {
+    if (grant.revoked_at) {
+      reject(`revoked:${grant.revoked_reason}`, 'Refresh token revoked', grant.sub);
       return;
     }
-    throw err;
-  }
 
-  const { sub, body } = issueTokens(fresh.creds, fresh.degraded ? RETRY_ACCESS_EXPIRY : TOKEN_EXPIRY);
-  log('info', `token refreshed sub=${sub} expires_in=${body.expires_in}`);
-  res.json(body);
+    const check = grants.checkRefresh(grant, String(payload.jti || ''), REFRESH_REUSE_GRACE_S);
+    if (check === 'reused') {
+      log('warn', `refresh token reuse detected sub=${grant.sub}, revoking the grant`);
+      await revokeGrant(grant, 'refresh_token_reuse');
+      reject('refresh_token_reuse', 'Refresh token revoked', grant.sub);
+      return;
+    }
+
+    let creds: Credentials;
+    try {
+      creds = grants.credentials(grant);
+    } catch {
+      reject('unreadable_credentials', 'Refresh token invalid', grant.sub);
+      return;
+    }
+
+    let fresh: { creds: Credentials; degraded: boolean };
+    try {
+      fresh = await freshCredentials(creds, grant.sub);
+    } catch (err) {
+      if (err instanceof SessionGone) {
+        // Nothing can be done with this grant anymore; end it everywhere.
+        await revokeGrant(grant, 'metabase_session_gone');
+        res.status(400).json({ error: 'invalid_grant', error_description: 'Metabase session expired; sign in again' });
+        return;
+      }
+      throw err;
+    }
+
+    const jti = newJti();
+    grants.rotate(grant, fresh.creds, jti);
+    const { body } = issueTokens(grant, jti, fresh.degraded ? RETRY_ACCESS_EXPIRY_S : TOKEN_EXPIRY_S);
+    log('info', `token refreshed sub=${grant.sub} expires_in=${body.expires_in}${check === 'grace' ? ' retry=true' : ''}`);
+    res.json(body);
+  });
 }
 
 app.post('/oauth/token', async (req: Request, res: Response) => {
-  const { grant_type, code, code_verifier } = req.body as Record<string, string>;
+  const { grant_type, code, code_verifier, redirect_uri } = req.body as Record<string, string>;
 
   if (grant_type === 'refresh_token') {
     await handleRefresh(req, res);
@@ -955,24 +1110,47 @@ app.post('/oauth/token', async (req: Request, res: Response) => {
     return;
   }
 
-  // PKCE verification (required when code_challenge was provided)
-  if (pending.code_challenge) {
-    if (!code_verifier) {
-      res.status(400).json({ error: 'invalid_grant', error_description: 'Missing code_verifier' });
-      return;
-    }
-    if (!verifyPkce(code_verifier, pending.code_challenge)) {
-      pendingCodes.delete(code);
-      res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
-      return;
-    }
-  }
-
+  // A code is spent by its first redemption, right or wrong, so it cannot be guessed at.
   pendingCodes.delete(code);
 
-  const { sub, body } = issueTokens(pickCredentials(pending));
+  if (!code_verifier) {
+    res.status(400).json({ error: 'invalid_grant', error_description: 'Missing code_verifier' });
+    return;
+  }
+  if (!verifyPkce(code_verifier, pending.code_challenge)) {
+    res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+    return;
+  }
+  // RFC 6749 §4.1.3: the code is only good where it was sent.
+  if (redirect_uri && redirect_uri !== pending.redirect_uri) {
+    res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+    return;
+  }
+
+  const { sub, body } = startGrant(pickCredentials(pending));
   log('info', `token issued grant=authorization_code sub=${sub} expires_in=${body.expires_in}`);
   res.json(body);
+});
+
+// ── Revocation (RFC 7009) ────────────────────────────────────────────────────
+// Either token of a grant revokes the whole grant. Expired tokens are accepted
+// (their grant may still be alive), and the answer is 200 whatever the token
+// was, so the endpoint tells nothing about which tokens exist.
+
+app.post('/oauth/revoke', async (req: Request, res: Response) => {
+  const { token } = req.body as Record<string, string>;
+  if (!token) {
+    res.status(400).json({ error: 'invalid_request', error_description: 'Missing token' });
+    return;
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET, { ...VERIFY_OPTIONS, ignoreExpiration: true }) as Record<string, any>;
+    const grant = grants.get(payload.gid);
+    if (grant) await withGrantLock(grant.id, () => revokeGrant(grant, 'client_revocation'));
+  } catch {
+    log('info', 'revocation ignored: token invalid');
+  }
+  res.status(200).end();
 });
 
 // ── MCP proxy ────────────────────────────────────────────────────────────────
@@ -1017,7 +1195,7 @@ app.use('/mcp', (req: Request, res: Response) => {
 
   let payload: Record<string, string>;
   try {
-    payload = jwt.verify(auth.slice(7), JWT_SECRET) as Record<string, string>;
+    payload = jwt.verify(auth.slice(7), JWT_SECRET, VERIFY_OPTIONS) as Record<string, string>;
   } catch (err) {
     // Recover the subject from the unverified payload: an expired token is exactly
     // the case worth correlating, and it is the one path where verification failed.
@@ -1043,32 +1221,31 @@ app.use('/mcp', (req: Request, res: Response) => {
   sub = payload.sub || '-';
 
   // Refresh tokens are long-lived by design; they must not authenticate MCP calls.
-  // Tokens issued before `typ` existed carry none, and stay valid until they expire.
-  if (payload.typ && payload.typ !== 'access') {
+  if (payload.typ !== 'access') {
     denial = 'wrong_token_type';
     challenge('invalid_token', 'Not an access token');
     res.status(401).json({ error: 'invalid_token', error_description: 'Not an access token' });
     return;
   }
 
-  // A token minted for a different resource must not be spendable here. Verified
-  // by hand rather than through jwt.verify's `audience` option, which rejects a
-  // token that carries no `aud` at all — that is every token issued before this
-  // claim existed, and rejecting those would disconnect their holders early.
-  if (payload.aud && payload.aud !== RESOURCE_URI) {
+  // A token minted for a different resource must not be spendable here (RFC 8707).
+  if (payload.aud !== RESOURCE_URI) {
     denial = 'wrong_audience';
     challenge('invalid_token', 'Token issued for another resource');
     res.status(401).json({ error: 'invalid_token', error_description: 'Token issued for another resource' });
     return;
   }
 
+  // Checked on every call, so a revoked grant stops working at once.
+  const grant = grants.get(payload.gid);
   let creds: Credentials;
   try {
-    creds = credentialsFromPayload(payload, sealer);
+    if (!grant) throw new Error('unknown grant');
+    creds = grants.credentials(grant);
   } catch {
-    denial = 'unreadable_credentials';
-    challenge('invalid_token', 'Token invalid');
-    res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid' });
+    denial = grant?.revoked_at ? 'grant_revoked' : 'unknown_grant';
+    challenge('invalid_token', 'Token revoked');
+    res.status(401).json({ error: 'invalid_token', error_description: 'Token revoked' });
     return;
   }
 
@@ -1172,7 +1349,7 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', upstream: MCP_UPSTREAM });
 });
 
-export { app };
+export { app, grants, startGrant };
 
 // ── Start ────────────────────────────────────────────────────────────────────
 

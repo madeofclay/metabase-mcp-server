@@ -14,6 +14,7 @@
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 
 export interface GoogleConfig {
   clientId: string;
@@ -108,6 +109,26 @@ function subjectOfIdToken(idToken: string): string | undefined {
     return typeof payload.sub === 'string' ? payload.sub : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Revokes a Google refresh token, so a revoked connection cannot mint Metabase
+ * sessions anymore even from a copy of the store. Best effort: false when Google
+ * could not be told.
+ */
+export async function revokeGoogleToken(token: string): Promise<boolean> {
+  try {
+    const res = await fetch(GOOGLE_REVOKE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token }).toString(),
+      signal: AbortSignal.timeout(5000),
+    });
+    // 400 invalid_token: already revoked or expired, which is the goal anyway.
+    return res.ok || res.status === 400;
+  } catch {
+    return false;
   }
 }
 

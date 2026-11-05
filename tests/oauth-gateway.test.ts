@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 
@@ -6,17 +6,30 @@ import jwt from 'jsonwebtoken';
 process.env.JWT_SECRET = 'test-secret-for-vitest';
 process.env.GATEWAY_URL = 'https://mcp.example.com';
 process.env.MCP_UPSTREAM = 'http://localhost:9999'; // unused in unit tests
+process.env.GRANT_STORE_PATH = ':memory:';
+process.env.ALLOWED_REDIRECT_HOSTS = 'client.example.com';
 
-const { app } = await import('../src/oauth-gateway.js');
-const { CredentialSealer } = await import('../src/credentials.js');
+const { app, grants } = await import('../src/oauth-gateway.js');
 
-// Verifies a token and returns its claims with the sealed credentials opened,
-// so assertions can look at both the way the gateway does.
-const sealer = new CredentialSealer('test-secret-for-vitest');
+const ISSUER = 'https://mcp.example.com';
+const RESOURCE = 'https://mcp.example.com/mcp';
+
+// PKCE is mandatory: every authorization uses this pair unless a test says otherwise.
+// echo -n 'test-verifier-string' | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '='
+const VERIFIER  = 'test-verifier-string';
+const CHALLENGE = 'LHKy4-q59ocwlltGr-0vD9UbiHBsIU09drZuupn1ghs';
+const PKCE = { code_challenge: CHALLENGE, code_challenge_method: 'S256' };
+
+// Verifies a token and returns its claims with its grant's credentials, so
+// assertions can look at both the way the gateway does.
 function decode(token: string): Record<string, any> {
-  const claims = jwt.verify(token, 'test-secret-for-vitest') as Record<string, any>;
-  return claims.cred ? { ...claims, ...sealer.open(claims.cred) } : claims;
+  const claims = jwt.verify(token, 'test-secret-for-vitest', { issuer: ISSUER }) as Record<string, any>;
+  const grant = grants.get(claims.gid);
+  return grant && !grant.revoked_at ? { ...claims, ...grants.credentials(grant) } : claims;
 }
+
+const exchange = (code: string, extra: Record<string, string> = {}) =>
+  request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code, code_verifier: VERIFIER, ...extra });
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -34,10 +47,8 @@ async function getAuthCode(opts: {
   if (opts.apiKey)       body.metabase_api_key = opts.apiKey;
   if (opts.username)     body.metabase_username = opts.username;
   if (opts.password)     body.metabase_password = opts.password;
-  if (opts.codeChallenge) {
-    body.code_challenge = opts.codeChallenge;
-    body.code_challenge_method = 'S256';
-  }
+  body.code_challenge = opts.codeChallenge || CHALLENGE;
+  body.code_challenge_method = 'S256';
   if (opts.state) body.state = opts.state;
 
   const res = await request(app).post('/oauth/authorize').send(body);
@@ -99,7 +110,7 @@ describe('GET /oauth/authorize', () => {
   it('returns HTML login form when redirect_uri is provided', async () => {
     const res = await request(app)
       .get('/oauth/authorize')
-      .query({ redirect_uri: 'https://client.example.com/callback' });
+      .query({ redirect_uri: 'https://client.example.com/callback', ...PKCE });
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toContain('text/html');
     expect(res.text).toContain('<form');
@@ -113,7 +124,7 @@ describe('GET /oauth/authorize', () => {
   it('escapes HTML in redirect_uri to prevent XSS', async () => {
     const res = await request(app)
       .get('/oauth/authorize')
-      .query({ redirect_uri: 'https://x.com/cb?a=<script>alert(1)</script>' });
+      .query({ redirect_uri: 'https://client.example.com/cb?a=<script>alert(1)</script>', ...PKCE });
     expect(res.text).not.toContain('<script>alert(1)</script>');
     expect(res.text).toContain('&lt;script&gt;');
   });
@@ -123,6 +134,7 @@ describe('POST /oauth/authorize', () => {
   it('redirects with code when api_key is provided', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_api_key: 'mb_test_key',
     });
@@ -134,6 +146,7 @@ describe('POST /oauth/authorize', () => {
   it('redirects with code when username+password is provided', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_username: 'admin@example.com',
       metabase_password: 'secret',
@@ -146,6 +159,7 @@ describe('POST /oauth/authorize', () => {
   it('includes state in redirect when provided', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_api_key: 'mb_test',
       state: 'xyz123',
@@ -165,6 +179,7 @@ describe('POST /oauth/authorize', () => {
   it('returns 400 when metabase_url is missing', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_api_key: 'mb_test',
     });
     expect(res.status).toBe(400);
@@ -173,6 +188,7 @@ describe('POST /oauth/authorize', () => {
   it('returns 400 when no credentials are provided', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
     });
     expect(res.status).toBe(400);
@@ -181,6 +197,7 @@ describe('POST /oauth/authorize', () => {
   it('returns 400 when only username is provided without password', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_username: 'admin@example.com',
     });
@@ -193,10 +210,7 @@ describe('POST /oauth/authorize', () => {
 describe('POST /oauth/token', () => {
   it('issues a JWT for a valid code (api_key flow)', async () => {
     const code = await getAuthCode({ apiKey: 'mb_real_key' });
-    const res = await request(app).post('/oauth/token').send({
-      grant_type: 'authorization_code',
-      code,
-    });
+    const res = await exchange(code);
     expect(res.status).toBe(200);
     expect(res.body.access_token).toBeTruthy();
     expect(res.body.token_type).toBe('bearer');
@@ -209,10 +223,7 @@ describe('POST /oauth/token', () => {
 
   it('issues a JWT for a valid code (username+password flow)', async () => {
     const code = await getAuthCode({ username: 'admin@example.com', password: 'secret' });
-    const res = await request(app).post('/oauth/token').send({
-      grant_type: 'authorization_code',
-      code,
-    });
+    const res = await exchange(code);
     expect(res.status).toBe(200);
     const decoded = decode(res.body.access_token);
     expect(decoded.metabase_username).toBe('admin@example.com');
@@ -247,8 +258,8 @@ describe('POST /oauth/token', () => {
 
   it('rejects a code used twice (single use)', async () => {
     const code = await getAuthCode();
-    await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
-    const res2 = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    await exchange(code);
+    const res2 = await exchange(code);
     expect(res2.status).toBe(400);
     expect(res2.body.error).toBe('invalid_grant');
   });
@@ -260,12 +271,13 @@ describe('POST /oauth/authorize - malformed API key', () => {
   it('drops a value that cannot be an API key and keeps the session token', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_api_key: 'my-saved-google-password',   // autofilled, not a key
       metabase_session_token: 'a-real-session-uuid',
     });
     const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
-    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const { body } = await exchange(code);
     const decoded = decode(body.access_token);
 
     // The API key outranks every other credential downstream, so keeping it
@@ -277,11 +289,12 @@ describe('POST /oauth/authorize - malformed API key', () => {
   it('keeps a well-formed API key', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_api_key: 'mb_realkey12345',
     });
     const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
-    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const { body } = await exchange(code);
     const decoded = decode(body.access_token);
     expect(decoded.metabase_api_key).toBe('mb_realkey12345');
   });
@@ -289,6 +302,7 @@ describe('POST /oauth/authorize - malformed API key', () => {
   it('rejects when the malformed key was the only credential', async () => {
     const res = await request(app).post('/oauth/authorize').send({
       redirect_uri: 'https://client.example.com/callback',
+      ...PKCE,
       metabase_url: 'https://metabase.example.com',
       metabase_api_key: 'not-a-key',
     });
@@ -296,7 +310,7 @@ describe('POST /oauth/authorize - malformed API key', () => {
   });
 
   it('marks the credential inputs so the SSO path can clear them', async () => {
-    const res = await request(app).get('/oauth/authorize?redirect_uri=https://client.example.com/cb');
+    const res = await request(app).get('/oauth/authorize').query({ redirect_uri: 'https://client.example.com/cb', ...PKCE });
     // Count the inputs themselves, not the querySelectorAll that clears them.
     const inputs = (res.text.match(/autocomplete="off" data-credential/g) || []).length;
     expect(inputs).toBe(4);
@@ -342,23 +356,25 @@ describe('GET /.well-known/oauth-protected-resource', () => {
 describe('access token audience', () => {
   it('binds the access token to the MCP resource', async () => {
     const code = await getAuthCode({ apiKey: 'mb_aud_key' });
-    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const { body } = await exchange(code);
     const decoded = decode(body.access_token);
     expect(decoded.aud).toBe('https://mcp.example.com/mcp');
   });
 
   it('leaves the refresh token unbound — it is redeemed at the AS, not the resource', async () => {
     const code = await getAuthCode({ apiKey: 'mb_aud_key' });
-    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const { body } = await exchange(code);
     const decoded = decode(body.refresh_token);
     expect(decoded.aud).toBeUndefined();
   });
 
   it('rejects a token minted for another resource', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_aud_key' });
+    const { body } = await exchange(code);
     const foreign = jwt.sign(
-      { metabase_url: 'https://metabase.example.com', typ: 'access', aud: 'https://other.example.com/mcp' },
+      { gid: decode(body.access_token).gid, typ: 'access', aud: 'https://other.example.com/mcp' },
       'test-secret-for-vitest',
-      { expiresIn: '8h' },
+      { expiresIn: '1h', issuer: ISSUER },
     );
     const res = await request(app)
       .post('/mcp')
@@ -368,9 +384,9 @@ describe('access token audience', () => {
     expect(res.body.error_description).toBe('Token issued for another resource');
   });
 
-  it('still accepts a token issued before the aud claim existed', async () => {
+  it('refuses a token from before grants existed, which carried the credentials itself', async () => {
     const legacy = jwt.sign(
-      { metabase_url: 'https://metabase.example.com' },
+      { metabase_url: 'https://metabase.example.com', metabase_api_key: 'mb_legacy' },
       'test-secret-for-vitest',
       { expiresIn: '8h' },
     );
@@ -378,7 +394,7 @@ describe('access token audience', () => {
       .post('/mcp')
       .set('Authorization', `Bearer ${legacy}`)
       .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
-    expect(res.status).not.toBe(401);
+    expect(res.status).toBe(401);
   });
 
   it('points the WWW-Authenticate challenge at the resource metadata', async () => {
@@ -394,7 +410,7 @@ describe('access token audience', () => {
 describe('POST /oauth/token - refresh_token grant', () => {
   async function getTokenPair(opts = { apiKey: 'mb_refresh_key' }) {
     const code = await getAuthCode(opts);
-    const res = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const res = await exchange(code);
     return res.body;
   }
 
@@ -573,6 +589,25 @@ describe('PKCE (S256)', () => {
     expect(res.body.error).toBe('invalid_grant');
   });
 
+  it('refuses an authorization request without PKCE', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://client.example.com/callback',
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'mb_key',
+    });
+    expect(res.status).toBe(400);
+    expect(res.text).toContain('PKCE');
+
+    const page = await request(app).get('/oauth/authorize').query({ redirect_uri: 'https://client.example.com/callback' });
+    expect(page.status).toBe(400);
+  });
+
+  it('refuses the plain PKCE method', async () => {
+    const page = await request(app).get('/oauth/authorize')
+      .query({ redirect_uri: 'https://client.example.com/callback', code_challenge: VERIFIER, code_challenge_method: 'plain' });
+    expect(page.status).toBe(400);
+  });
+
   it('rejects token when PKCE verifier is missing', async () => {
     const code = await getAuthCode({ apiKey: 'mb_pkce', codeChallenge: challenge });
     const res = await request(app).post('/oauth/token').send({
@@ -632,7 +667,7 @@ describe('POST /mcp - authentication', () => {
 
   it('refuses a refresh token used as a bearer credential', async () => {
     const code = await getAuthCode({ apiKey: 'mb_key' });
-    const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
+    const { body } = await exchange(code);
     const res = await request(app)
       .post('/mcp')
       .set('Authorization', `Bearer ${body.refresh_token}`)
@@ -655,6 +690,143 @@ describe('POST /mcp - authentication', () => {
 
     const none = await request(app).post('/mcp').send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
     expect(none.headers['www-authenticate']).toContain('Bearer realm=');
+  });
+});
+
+// ── Grants: rotation, reuse detection and revocation ─────────────────────────
+
+describe('grants', () => {
+  async function pair(apiKey = 'mb_grant_key') {
+    const code = await getAuthCode({ apiKey });
+    return (await exchange(code)).body;
+  }
+  const refreshWith = (refresh_token: string) =>
+    request(app).post('/oauth/token').send({ grant_type: 'refresh_token', refresh_token });
+  const callMcp = (access: string) =>
+    request(app).post('/mcp').set('Authorization', `Bearer ${access}`)
+      .send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+  afterEach(() => vi.useRealTimers());
+
+  it('keeps every credential out of the tokens', async () => {
+    const body = await pair('mb_never_in_a_token');
+    const readable = JSON.stringify(jwt.decode(body.access_token)) + JSON.stringify(jwt.decode(body.refresh_token));
+    expect(readable).not.toContain('mb_never_in_a_token');
+    expect(readable).not.toContain('metabase.example.com');
+    expect(jwt.decode(body.access_token)).not.toHaveProperty('cred');
+  });
+
+  it('uses a short access token and a refresh token that dies when idle', async () => {
+    const body = await pair();
+    expect(body.expires_in).toBe(3600);
+    expect(body.refresh_expires_in).toBe(7 * 86400);
+  });
+
+  it('honours a replaced refresh token briefly, for a client retrying a lost response', async () => {
+    const body = await pair();
+    const first = await refreshWith(body.refresh_token);
+    expect(first.status).toBe(200);
+    const retry = await refreshWith(body.refresh_token);
+    expect(retry.status).toBe(200);
+  });
+
+  it('revokes the whole grant when a replaced refresh token comes back later', async () => {
+    const body = await pair();
+    const rotated = (await refreshWith(body.refresh_token)).body;
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 31_000);
+
+    const replay = await refreshWith(body.refresh_token);
+    expect(replay.status).toBe(400);
+    expect(replay.body.error_description).toBe('Refresh token revoked');
+
+    // The legitimate holder is cut off too: nobody can tell which copy is the thief's.
+    expect((await refreshWith(rotated.refresh_token)).body.error_description).toBe('Refresh token revoked');
+    const mcp = await callMcp(rotated.access_token);
+    expect(mcp.status).toBe(401);
+    expect(mcp.body.error_description).toBe('Token revoked');
+  });
+
+  it('serializes concurrent refreshes so neither looks like a reuse', async () => {
+    const body = await pair();
+    const [a, b] = await Promise.all([refreshWith(body.refresh_token), refreshWith(body.refresh_token)]);
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+  });
+
+  it('ends a grant on revocation, effective at once for its access token', async () => {
+    const body = await pair();
+    expect((await callMcp(body.access_token)).status).toBe(202);
+
+    const revoked = await request(app).post('/oauth/revoke').type('form').send({ token: body.refresh_token });
+    expect(revoked.status).toBe(200);
+
+    expect((await callMcp(body.access_token)).status).toBe(401);
+    expect((await refreshWith(body.refresh_token)).status).toBe(400);
+  });
+
+  it('revokes with the access token too', async () => {
+    const body = await pair();
+    await request(app).post('/oauth/revoke').send({ token: body.access_token });
+    expect((await refreshWith(body.refresh_token)).body.error_description).toBe('Refresh token revoked');
+  });
+
+  it('answers 200 to a revocation of an unknown token, revealing nothing', async () => {
+    const res = await request(app).post('/oauth/revoke').send({ token: 'not.a.jwt' });
+    expect(res.status).toBe(200);
+  });
+
+  it('advertises the revocation endpoint', async () => {
+    const res = await request(app).get('/.well-known/oauth-authorization-server');
+    expect(res.body.revocation_endpoint).toBe('https://mcp.example.com/oauth/revoke');
+  });
+
+  it('refuses a token signed with another algorithm or issuer', async () => {
+    const body = await pair();
+    const { gid } = decode(body.access_token);
+    const otherIssuer = jwt.sign({ gid, typ: 'access', aud: RESOURCE }, 'test-secret-for-vitest', { issuer: 'https://evil.example.com', expiresIn: '1h' });
+    expect((await callMcp(otherIssuer)).status).toBe(401);
+    const unsigned = jwt.sign({ gid, typ: 'access', aud: RESOURCE, iss: ISSUER }, '', { algorithm: 'none' } as any);
+    expect((await callMcp(unsigned)).status).toBe(401);
+  });
+});
+
+// ── Where codes may go ───────────────────────────────────────────────────────
+
+describe('redirect_uri', () => {
+  it('refuses to send a code to a host outside the allowlist', async () => {
+    const res = await request(app).post('/oauth/authorize').send({
+      redirect_uri: 'https://attacker.example.net/cb',
+      ...PKCE,
+      metabase_url: 'https://metabase.example.com',
+      metabase_api_key: 'mb_key',
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers['location']).toBeUndefined();
+  });
+
+  it('refuses to register such a client', async () => {
+    const res = await request(app).post('/oauth/register').send({ redirect_uris: ['https://attacker.example.net/cb'] });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_redirect_uri');
+  });
+
+  it('allows a loopback redirect, for local clients', async () => {
+    const res = await request(app).post('/oauth/register').send({ redirect_uris: ['http://localhost:33418/callback'] });
+    expect(res.status).toBe(201);
+  });
+
+  it('refuses plain http to a remote host', async () => {
+    const res = await request(app).post('/oauth/register').send({ redirect_uris: ['http://client.example.com/cb'] });
+    expect(res.status).toBe(400);
+  });
+
+  it('only redeems a code where it was sent', async () => {
+    const code = await getAuthCode({ apiKey: 'mb_key' });
+    const res = await exchange(code, { redirect_uri: 'https://client.example.com/other' });
+    expect(res.status).toBe(400);
+    expect(res.body.error_description).toBe('redirect_uri mismatch');
   });
 });
 

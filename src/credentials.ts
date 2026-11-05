@@ -1,11 +1,10 @@
 /**
- * Metabase credentials carried inside the gateway's JWTs.
+ * Metabase credentials of a connection, and how they are sealed at rest.
  *
- * The gateway keeps no server-side session: the token *is* the credential. A JWT
- * is signed, not encrypted, so anything placed in its payload can be read by
- * whoever holds the token (or a log line that captured it). The credentials are
- * therefore sealed with AES-256-GCM under a key derived from JWT_SECRET, and the
- * token only carries the ciphertext.
+ * They never travel in a token: the gateway keeps them in its grant store
+ * (src/grant-store.ts), sealed with AES-256-GCM under a key derived from
+ * JWT_SECRET. Each ciphertext is bound to its grant id (GCM additional data), so
+ * it cannot be moved to another grant in the store file.
  */
 
 import crypto from 'crypto';
@@ -64,33 +63,27 @@ export class CredentialSealer {
     );
   }
 
-  seal(creds: Credentials): string {
+  /** `context` is authenticated, not encrypted: opening needs the same value. */
+  seal(creds: Credentials, context = ''): string {
     const iv = crypto.randomBytes(IV_BYTES);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
+    cipher.setAAD(Buffer.from(context, 'utf8'));
     const ciphertext = Buffer.concat([cipher.update(JSON.stringify(creds), 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return `${VERSION}.${Buffer.concat([iv, tag, ciphertext]).toString('base64url')}`;
   }
 
-  /** Throws when the value was not sealed with this key or was tampered with. */
-  open(sealed: string): Credentials {
+  /** Throws when the value was not sealed with this key and context, or was tampered with. */
+  open(sealed: string, context = ''): Credentials {
     const [version, body] = sealed.split('.');
     if (version !== VERSION || !body) throw new Error('unknown credential format');
     const raw = Buffer.from(body, 'base64url');
     const iv = raw.subarray(0, IV_BYTES);
     const tag = raw.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
     const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
+    decipher.setAAD(Buffer.from(context, 'utf8'));
     decipher.setAuthTag(tag);
     const plain = Buffer.concat([decipher.update(raw.subarray(IV_BYTES + TAG_BYTES)), decipher.final()]);
     return pickCredentials(JSON.parse(plain.toString('utf8')));
   }
-}
-
-/**
- * The credentials of a verified token. Tokens issued before credentials were
- * sealed carry them in the clear, and stay usable until they expire.
- */
-export function credentialsFromPayload(payload: Record<string, any>, sealer: CredentialSealer): Credentials {
-  if (typeof payload.cred === 'string') return sealer.open(payload.cred);
-  return pickCredentials(payload);
 }

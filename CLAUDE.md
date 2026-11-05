@@ -19,12 +19,23 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    REST API de Metabase (axios) usando la sesión/API key resuelta.
 4. En modo HTTP Stream, el servidor escucha en `/mcp` (puerto 8011 por defecto).
 5. Opcionalmente, `src/oauth-gateway.ts` corre un servidor Express separado (puerto
-   8080 por defecto) que implementa Authorization Code + PKCE: muestra un formulario
-   para ingresar credenciales Metabase, emite un JWT propio, y proxea las llamadas al
-   servidor HTTP Stream inyectando los headers `x-metabase-*`. Las credenciales van
-   **cifradas** dentro del JWT (AES-256-GCM, clave derivada de `JWT_SECRET`,
-   `src/credentials.ts`): un JWT sólo va firmado y sin esto se leía la API key, la
-   contraseña o la sesión decodificándolo.
+   8080 por defecto) que implementa Authorization Code + PKCE (obligatorio, S256):
+   muestra un formulario para ingresar credenciales Metabase y proxea las llamadas al
+   servidor HTTP Stream inyectando los headers `x-metabase-*`. Cada conexión es un
+   **grant** guardado en el servidor (`src/grant-store.ts`, archivo JSON 0600 en
+   `GRANT_STORE_PATH`): las credenciales van ahí cifradas (AES-256-GCM, clave
+   derivada de `JWT_SECRET`, ligadas al id del grant, `src/credentials.ts`) y los
+   JWT sólo llevan el id del grant, firmados HS256 con emisor fijo. Así un token
+   filtrado no revela nada y revocar corta todos los tokens del grant al instante,
+   porque `/mcp` revisa el grant en cada llamada. Plazos: acceso 1 h, refresh 7 días
+   sin uso, grant 30 días absolutos. El refresh rota en cada uso y el almacén sólo
+   guarda un HMAC de su `jti`: si vuelve un refresh ya reemplazado (pasados 30 s de
+   gracia para reintentos), se revoca el grant entero. `POST /oauth/revoke`
+   (RFC 7009) revoca el grant, cierra su sesión de Metabase y revoca el permiso de
+   Google. Los códigos sólo se envían a `ALLOWED_REDIRECT_HOSTS` (por defecto
+   `claude.ai`, `claude.com`) o a loopback; si no, un link armado podía llevarse el
+   código de otra persona. Los tokens anteriores a los grants (credenciales dentro
+   del JWT) ya no sirven: al desplegar, cada usuario reconecta una vez.
 6. Con `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`, "Continuar con Google" pasa por el
    gateway (`/oauth/google/start` → Google → `/oauth/google/callback`,
    `src/google-sso.ts`) con el cliente OAuth de Google **del propio Metabase** y acceso
@@ -35,8 +46,8 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    así que sin cerrarla renovar seguido no acortaría nada. Metabase vence
    cada sesión a los 14 días (`MAX_SESSION_AGE`) y antes la conexión moría ahí sin
    remedio (IAD-1210). Una sesión muerta que no se puede renovar hace fallar el
-   refresh con `invalid_grant`, para que Claude pida reconectar en vez de fallar en
-   cada tool. Sin esas dos variables queda el login de Google en el navegador, sin
+   refresh con `invalid_grant` y revoca el grant, para que Claude pida reconectar en
+   vez de fallar en cada tool. Sin esas dos variables queda el login de Google en el navegador, sin
    renovación.
 
 ## Estructura de carpetas
@@ -45,7 +56,8 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
 src/
   server.ts              # entrypoint MCP (stdio y HTTP Stream), registro de tools y filtrado
   oauth-gateway.ts        # gateway Express OAuth2 (Authorization Code + PKCE) para clientes como Claude.ai
-  credentials.ts          # credenciales que viajan en el JWT, cifradas (AES-256-GCM)
+  credentials.ts          # credenciales de una conexión y su cifrado (AES-256-GCM)
+  grant-store.ts          # grants en servidor: credenciales cifradas, rotación y revocación
   google-sso.ts           # login de Google en el servidor + renovación de la sesión de Metabase
   auth.ts                 # resolución de credenciales por request (headers x-metabase-*) en modo HTTP
   client/
@@ -63,7 +75,7 @@ docs/spec-google-sso-auth.md  # spec (no implementada del todo) para soportar se
 Dockerfile / docker-compose.yml / docker-run.sh  # empaquetado para self-host vía Docker
 smithery.yaml             # manifiesto para publicar en el registro Smithery (MCP)
 .github/workflows/publish.yml  # única CI/CD: publica el paquete a npm en push a main
-tests/                    # vitest (auth, config, metabase-client, oauth-gateway, tool-filters)
+tests/                    # vitest (auth, config, metabase-client, oauth-gateway, google-sso, grant-store, tool-filters)
 ```
 
 ## Dependencias de infraestructura
@@ -77,9 +89,10 @@ tests/                    # vitest (auth, config, metabase-client, oauth-gateway
 | EC2 `ai-agents-dev` (gracia-dev) | Host del servidor y del gateway (ver Deploy) | develop |
 
 No hay bases de datos propias, colas SQS/SNS, buckets S3, tablas DynamoDB, Lambdas,
-clusters EKS ni Terraform en este repo. El único estado en memoria es un `Map` de
-códigos de autorización pendientes dentro de `oauth-gateway.ts` (TTL 10 minutos, se
-pierde al reiniciar el proceso).
+clusters EKS ni Terraform en este repo. El estado del gateway es: los grants en un
+archivo local (`GRANT_STORE_PATH`, por defecto `./data/grants.json`, fuera de git;
+sobrevive reinicios, y si se borra todos reconectan) y un `Map` en memoria de
+códigos de autorización pendientes (TTL 10 minutos).
 
 ## Ejecución local
 
@@ -125,7 +138,10 @@ programas de supervisord en `/etc/supervisord.conf.d/`: `dist/server.js` (HTTP S
 Logs: `/var/log/metabase_mcp_oauth_gateway.err.log` (gateway) y
 `/var/log/metabase_mcp_http.err.log` (errores de Metabase, con `auth_mode`).
 Desplegar = `git pull` + `npm run build` en ese clon + `sudo supervisorctl restart`
-de los dos programas. No hay despliegue en gracia-prod.
+de los dos programas. El gateway necesita `GRANT_STORE_PATH` en un directorio
+escribible por su usuario (el archivo lleva credenciales cifradas: no copiarlo ni
+respaldarlo junto con `JWT_SECRET`). Rotar `METABASE_MCP_GATEWAY_SECRET` invalida
+todos los grants y obliga a reconectar. No hay despliegue en gracia-prod.
 
 **Gotcha detectado (no corregido en este levantamiento):** el `CMD` del `Dockerfile`
 ejecuta `node dist/index.js`, pero el build y `package.json.main` generan
