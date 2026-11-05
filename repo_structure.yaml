@@ -48,7 +48,7 @@ dependencies:
       environments: [develop]
   secrets:
     - vault: clay-data-secrets-{env}
-      keys: [METABASE_MCP_GATEWAY_SECRET, METABASE_MCP_GOOGLE_CLIENT_SECRET]
+      keys: [METABASE_MCP_GATEWAY_SECRET, METABASE_GOOGLE_CLIENT_SECRET]
       environments: [develop]
 
 owners:

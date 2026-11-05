@@ -40,7 +40,7 @@
  * Google SSO connection survives Metabase's session expiry: on refresh, the
  * gateway mints a new Metabase session from the user's Google refresh token.
  *   GOOGLE_CLIENT_ID       Metabase's Google OAuth client id (enables the flow)
- *   GOOGLE_CLIENT_SECRET   Its secret (env var or vault key METABASE_MCP_GOOGLE_CLIENT_SECRET)
+ *   GOOGLE_CLIENT_SECRET   Its secret (env var or vault key METABASE_GOOGLE_CLIENT_SECRET)
  *   GOOGLE_REDIRECT_URI    Callback registered in that client (default: GATEWAY_URL/oauth/google/callback)
  *   METABASE_SESSION_RENEW_DAYS  Renew a session this old on refresh, ending the
  *                          previous one (default: 1). Bounds how long a leaked
@@ -160,7 +160,7 @@ async function loadGoogleConfig(): Promise<GoogleConfig | null> {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   if (!clientId) return null;
   try {
-    await hydrateEnvFromVault({ GOOGLE_CLIENT_SECRET: 'METABASE_MCP_GOOGLE_CLIENT_SECRET' });
+    await hydrateEnvFromVault({ GOOGLE_CLIENT_SECRET: 'METABASE_GOOGLE_CLIENT_SECRET' });
   } catch (err) {
     log('warn', `Google client secret unavailable: ${(err as Error).message}`);
   }

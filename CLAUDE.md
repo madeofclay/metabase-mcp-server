@@ -85,7 +85,7 @@ tests/                    # vitest (auth, config, metabase-client, oauth-gateway
 | Metabase (externo) | Instancia Metabase de Clay (ej. `analytics.clay.cl`), consumida vía REST API | prod y develop (según `METABASE_URL` / header `x-metabase-url`) |
 | Registro npm | `@cognitionai/metabase-mcp-server` (scope del proyecto upstream, no `madeofclay`) | prod (publicación en cada push a `main`) |
 | Google OAuth (externo) | Cliente OAuth del Google SSO de Metabase; el gateway lo usa con acceso offline. Necesita el redirect URI `https://data-dev.clay.cl/oauth/google/callback` autorizado en ese cliente y la pantalla de consentimiento Interna (en modo "Testing" los refresh tokens vencen a los 7 días) | develop (el único despliegue) |
-| AWS Secrets Manager | `clay-data-secrets-{env}`: `METABASE_MCP_GATEWAY_SECRET` (firma y cifrado de los JWT) y `METABASE_MCP_GOOGLE_CLIENT_SECRET` (secreto del cliente de Google) | develop |
+| AWS Secrets Manager | `clay-data-secrets-{env}`: `METABASE_MCP_GATEWAY_SECRET` (firma y cifrado de los JWT) y `METABASE_GOOGLE_CLIENT_SECRET` (secreto del cliente OAuth de Google del proyecto Metabase; es el mismo para cualquier subdominio, así que no lleva el prefijo del MCP) | develop |
 | EC2 `ai-agents-dev` (gracia-dev) | Host del servidor y del gateway (ver Deploy) | develop |
 
 No hay bases de datos propias, colas SQS/SNS, buckets S3, tablas DynamoDB, Lambdas,
