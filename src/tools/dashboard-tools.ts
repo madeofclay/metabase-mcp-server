@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { MetabaseClient } from "../client/metabase-client.js";
 import { isDestructiveAllowed, destructiveDisabledMessage } from "../utils/tool-filters.js";
+import { toolOutput } from "../utils/compact-result.js";
 
 export function addDashboardTools(server: any, getClient: (ctx?: any) => MetabaseClient) {
   /**
@@ -435,7 +436,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
         .array(z.object({}).passthrough())
         .optional()
         .describe("Series data for the card"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: {
       dashboard_id: number;
       cardId?: number | null;
@@ -450,12 +452,12 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     }, context: any) => {
       const metabaseClient = getClient(context);
       try {
-        const { dashboard_id, ...cardData } = args;
+        const { dashboard_id, include_dashboard: _full, ...cardData } = args as any;
         const result = await metabaseClient.addCardToDashboard(
           dashboard_id,
           cardData
         );
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to add card to dashboard ${args.dashboard_id}: ${
@@ -505,7 +507,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
         .optional()
         .describe("Dashcard/filter pairs to leave unconnected"),
       dry_run: z.boolean().optional().describe("Validate and show the mappings without writing"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: {
       dashboard_id: number;
       parameters: any[];
@@ -519,7 +522,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           exclude: args.exclude,
           dryRun: args.dry_run,
         });
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to set the filters of dashboard ${args.dashboard_id}: ${
@@ -569,11 +572,12 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
       width: z.enum(["fixed", "full"]).optional().describe("Dashboard width"),
       dry_run: z.boolean().optional().describe("Validate and show the diff without writing"),
       confirm_removals: z.boolean().optional().describe("Required when the layout deletes dashcards or tabs"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: any, context: any) => {
       const metabaseClient = getClient(context);
       try {
-        const { dashboard_id, dry_run, confirm_removals, ...layout } = args;
+        const { dashboard_id, dry_run, confirm_removals, include_dashboard: _full, ...layout } = args;
         if (!dry_run && !isDestructiveAllowed()) {
           // Deleting dashcards or tabs is off: refuse a layout that would drop any.
           const preview: any = await metabaseClient.putDashboardLayout(dashboard_id, layout, { dryRun: true });
@@ -590,7 +594,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           dryRun: dry_run,
           confirmRemovals: confirm_removals,
         });
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to write the layout of dashboard ${args.dashboard_id}: ${
@@ -620,7 +624,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
         .describe("Where the cards of deleted tabs go: a tab id from the new list, or its position in it (0 = first)"),
       dry_run: z.boolean().optional().describe("Validate and show what would change, without writing"),
       confirm: z.boolean().optional().describe("Required to remove every tab"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: {
       dashboard_id: number;
       tabs: { id?: number; name: string }[];
@@ -649,7 +654,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           dryRun: args.dry_run,
           confirm: args.confirm,
         });
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to update the tabs of dashboard ${args.dashboard_id}: ${
@@ -697,7 +702,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
       col: z.number().optional().default(0).describe("Column position"),
       size_x: z.number().optional().default(18).describe("Width of the text block"),
       size_y: z.number().optional().describe("Height of the text block"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: {
       dashboard_id: number;
       text: string;
@@ -735,7 +741,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           args.dashboard_id,
           cardData
         );
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to add text block to dashboard ${args.dashboard_id}: ${
@@ -1016,7 +1022,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
             .passthrough()
         )
         .describe("Array of card configurations"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: { dashboard_id: number; cards: any[] }, context: any) => {
       const metabaseClient = getClient(context);
       try {
@@ -1024,7 +1031,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           args.dashboard_id,
           args.cards
         );
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to update cards on dashboard ${args.dashboard_id}: ${
@@ -1145,7 +1152,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       dashcard_ids: z.array(z.number()).describe("Array of dashcard IDs to remove (the 'id' field from dashcards, not 'card_id')"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: { dashboard_id: number; dashcard_ids: number[] }, context: any) => {
       const metabaseClient = getClient(context);
       try {
@@ -1153,7 +1161,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           args.dashboard_id,
           args.dashcard_ids
         );
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to remove cards from dashboard ${args.dashboard_id}: ${
@@ -1321,7 +1329,8 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
         size_x: z.number().optional().describe("Width of the card"),
         size_y: z.number().optional().describe("Height of the card"),
       }).passthrough().describe("Properties to update on the dashcard"),
-    }).strict(),
+          include_dashboard: z.boolean().optional().describe("Return the full dashboard (and the full payload on dry_run) instead of a summary"),
+}).strict(),
     execute: async (args: { dashboard_id: number; dashcard_id: number; updates: any }, context: any) => {
       const metabaseClient = getClient(context);
       try {
@@ -1330,7 +1339,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
           args.dashcard_id,
           args.updates
         );
-        return JSON.stringify(result, null, 2);
+        return toolOutput(result, (args as any)?.include_dashboard);
       } catch (error) {
         throw new Error(
           `Failed to update dashcard ${args.dashcard_id} on dashboard ${args.dashboard_id}: ${

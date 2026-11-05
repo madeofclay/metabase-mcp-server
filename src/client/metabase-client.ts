@@ -3,6 +3,7 @@
  * Handles all API interactions with Metabase
  */
 
+import { explainMetabaseError } from "../utils/metabase-errors.js";
 import axios, { AxiosInstance } from "axios";
 import { ErrorCode, McpError } from "../types/errors.js";
 import {
@@ -199,7 +200,7 @@ export class MetabaseClient {
     // client, and the only trace left here was a successful-looking request.
     this.axiosInstance.interceptors.response.use(
       (response) => response,
-      (error) => {
+      async (error) => {
         const status = error?.response?.status;
         if (status) {
           this.logUpstream(
@@ -208,10 +209,42 @@ export class MetabaseClient {
             status,
           );
         }
+        // Replace axios' «Request failed with status code 403» with what was
+        // refused, for whom, what Metabase said and what to do next.
+        if (status === 401 || status === 403) {
+          const user = status === 403 && error?.config?.url !== '/api/user/current'
+            ? await this.currentUserEmail()
+            : undefined;
+          const message = explainMetabaseError({
+            status,
+            method: error?.config?.method,
+            url: error?.config?.url,
+            data: error?.config?.data,
+            responseData: error?.response?.data,
+            user,
+          });
+          if (message && error instanceof Error) error.message = message;
+        }
         return Promise.reject(error);
       }
     );
 
+  }
+
+  private userEmailLookup?: Promise<string | undefined>;
+
+  /**
+   * The signed-in user's email, for permission errors. Read once per client; a
+   * failure (the credential may be the problem) just leaves it out.
+   */
+  private currentUserEmail(): Promise<string | undefined> {
+    if (!this.userEmailLookup) {
+      this.userEmailLookup = this.axiosInstance
+        .get('/api/user/current')
+        .then((r) => r?.data?.email || r?.data?.common_name || undefined)
+        .catch(() => undefined);
+    }
+    return this.userEmailLookup;
   }
 
   /**
