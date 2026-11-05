@@ -9,6 +9,7 @@ import { addCardTools } from "./tools/card-tools.js";
 import { addTableTools } from "./tools/table-tools.js";
 import { addAdditionalTools } from "./tools/additional-tools.js";
 import { parseToolFilterOptions, toolAllowed } from "./utils/tool-filters.js";
+import { toolAnnotations } from "./utils/tool-annotations.js";
 import { createAuthenticateHandler, createClientResolver } from "./auth.js";
 import { hydrateEnvFromVault } from "./utils/secrets.js";
 
@@ -51,12 +52,17 @@ if (isHttpMode) {
 // Create FastMCP server
 const server = new FastMCP(serverOptions);
 
-// Override addTool to apply tool filtering (unchanged behavior)
+// Override addTool to apply tool filtering and attach the MCP annotations that
+// clients use to group tools (read-only vs. write vs. destructive).
 const originalAddTool = server.addTool.bind(server);
 server.addTool = function(toolConfig: any) {
   const { metadata = {}, ...restConfig } = toolConfig;
   if (!toolAllowed(filterOptions.mode, metadata)) return;
-  originalAddTool(restConfig);
+  const annotations = toolAnnotations(restConfig.name);
+  if (!annotations) {
+    console.error(`WARN: tool ${restConfig.name} has no group in src/utils/tool-annotations.ts`);
+  }
+  originalAddTool(annotations ? { ...restConfig, annotations: { ...annotations, ...restConfig.annotations } } : restConfig);
 };
 
 // Adding all tools — each execute calls getClient(context) internally

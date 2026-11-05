@@ -61,6 +61,18 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    sólo los campos que acepta el PUT, valida antes de escribir y devuelve
    `previous_revision_id` para `revert_dashboard`.
 
+## Grupos de tools
+
+Cada tool declara anotaciones MCP (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+`openWorldHint`) según su grupo en `src/utils/tool-annotations.ts`: **lectura** (sólo
+lee o corre queries), **escritura** (crea o edita sin perder nada) o **destructiva**
+(borra, reemplaza o revierte, incluidas las conexiones de BD). `server.ts` las agrega al
+registrar cada tool. Claude.ai usa esos grupos para que la organización o cada usuario
+permita, pida confirmación o bloquee cada grupo; sin anotaciones todas caen en «Otras
+herramientas». Una tool nueva tiene que entrar en un grupo: `tests/tool-annotations.test.ts`
+falla si falta. `validate_database` no guarda nada, pero conecta a un host que elige quien
+llama, así que va en escritura y no en lectura.
+
 ## Gotchas de Metabase 0.63
 
 Verificados contra analytics.clay.cl (dashboard 621 y su copia de prueba 622):
@@ -114,6 +126,7 @@ src/
     config.ts             # carga y valida METABASE_URL / credenciales desde env vars
     tool-filters.ts       # modo de tools: flags --essential/--all/--read/--write o METABASE_MCP_TOOLS
     template-tags.ts      # {{variables}} del SQL nativo -> template tags (MBQL 5 y legacy)
+    tool-annotations.ts   # grupo de cada tool (lectura, escritura, destructiva) -> anotaciones MCP
   types/                  # tipos de config y errores
 docs/spec-google-sso-auth.md  # spec (no implementada del todo) para soportar sesión de Google SSO
 Dockerfile / docker-compose.yml / docker-run.sh  # empaquetado para self-host vía Docker
