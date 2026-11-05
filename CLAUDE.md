@@ -107,6 +107,24 @@ destructivas y su anotación lo dice. El interruptor lo lee `isDestructiveAllowe
   por cliente en `/api/user/current`), el detalle que mandó Metabase y qué hacer
   (reconectar en un 401, pedir acceso a un admin en un 403). `src/utils/metabase-errors.ts`.
 
+## Verificar antes de publicar
+
+- `run_dashcards` corre la query de cada tarjeta como consulta suelta (`POST /api/dataset`) con
+  los valores que mandaría el dashboard. **No** usa el endpoint del dashcard porque ese
+  guarda los valores como «últimos filtros usados» del usuario: probar un mes futuro dejaba
+  el dashboard real vacío para esa persona. Además valida el gráfico contra las columnas del
+  resultado (`chart_error`: tendencia sin columna de fecha, `graph.metrics` que no existe,
+  etc.). No mira el dibujo: para eso está `preview_card`.
+- `preview_card` devuelve la tarjeta como PNG (`GET /api/pulse/preview_card_png/:id`, el
+  render estático de las suscripciones), con los valores por defecto de la pregunta.
+- `create_card` y `update_card` responden un resumen con columnas, template tags y
+  `chart_errors`/`chart_warnings` sobre `result_metadata` (`include_full` para todo).
+- `update_dashcard` **combina** `visualization_settings` (y `column_settings` por columna);
+  `replace_visualization_settings: true` para reemplazarlos.
+- `put_dashboard_layout` devuelve `created: [{temp_id, id}]` con el id real de cada tarjeta
+  nueva (se empareja por pestaña, posición, tamaño y card).
+- `get_dashboard` responde un resumen con una línea por tarjeta (`include_full` para todo).
+
 ## Gotchas de Metabase 0.63
 
 Verificados contra analytics.clay.cl (dashboard 621 y su copia de prueba 622):
@@ -162,7 +180,8 @@ src/
     template-tags.ts      # {{variables}} del SQL nativo -> template tags (MBQL 5 y legacy)
     tool-annotations.ts   # grupo de cada tool (lectura, escritura, destructiva) -> anotaciones MCP
     compact-result.ts     # resumen de las respuestas de las tools que escriben un dashboard
-    metabase-errors.ts    # mensajes explícitos para 401/403 (recurso, usuario, qué hacer)
+    metabase-errors.ts    # mensajes explícitos para 401/403 y detalle de Metabase en otros 4xx
+    viz-validation.ts     # ¿el resultado de la query calza con el gráfico? (tendencia sin fecha, métricas faltantes…)
   types/                  # tipos de config y errores
 docs/spec-google-sso-auth.md  # spec (no implementada del todo) para soportar sesión de Google SSO
 Dockerfile / docker-compose.yml / docker-run.sh  # empaquetado para self-host vía Docker
