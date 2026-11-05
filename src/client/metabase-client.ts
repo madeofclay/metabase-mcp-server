@@ -32,6 +32,64 @@ function tabList(tabs: any[]): string {
   return tabs.length ? tabs.map((t) => `${t.id} (${t.name})`).join(', ') : 'none';
 }
 
+const GRID_COLUMNS = 24;
+
+/**
+ * The new tab list with ids: existing tabs keep theirs, new ones get negative
+ * ids. Verified on Metabase 0.63 (dashboard 621): one PUT with negative tab ids
+ * and dashcards pointing at them (text cards with card_id null and negative
+ * dashcard ids included) creates the tabs with their cards in place.
+ */
+function resolveTabs(dashboardId: number, currentTabs: any[], tabs: { id?: number; name: string }[]): { id: number; name: string }[] {
+  const currentIds = new Set(currentTabs.map((t: any) => t.id));
+  const taken = new Set<number>();
+  for (const t of tabs) {
+    if (t.id === undefined) continue;
+    if (t.id === 0) throw new Error('Tab id 0 is not valid: omit the id for a new tab');
+    if (t.id > 0 && !currentIds.has(t.id)) {
+      throw new Error(`Tab ${t.id} is not in dashboard ${dashboardId}. Tabs: ${tabList(currentTabs)}`);
+    }
+    if (taken.has(t.id)) throw new Error(`Tab ${t.id} appears twice in the list`);
+    taken.add(t.id);
+  }
+  let nextNew = -1;
+  return tabs.map((t) => {
+    const name = (t.name || '').trim();
+    if (!name) throw new Error('Every tab needs a name');
+    let id = t.id;
+    if (id === undefined) {
+      while (taken.has(nextNew)) nextNew--;
+      id = nextNew;
+      taken.add(id);
+    }
+    return { id, name };
+  });
+}
+
+/** {text, display} shorthand → a virtual text or heading dashcard. Raw dashcards pass through. */
+function expandTextCard(dc: any): any {
+  if (dc.text === undefined) return dc;
+  const { text, display = 'text', ...rest } = dc;
+  const vs = rest.visualization_settings || {};
+  return {
+    ...rest,
+    card_id: null,
+    visualization_settings: {
+      'dashcard.background': display !== 'heading',
+      ...vs,
+      virtual_card: { ...(vs.virtual_card || {}), display },
+      text,
+    },
+  };
+}
+
+function dashcardLabel(dc: any): string {
+  if (dc.card?.name) return dc.card.name;
+  const text = dc.visualization_settings?.text;
+  if (typeof text === 'string') return `text: ${text.replace(/\s+/g, ' ').slice(0, 40)}`;
+  return dc.card_id ? `card ${dc.card_id}` : 'virtual card';
+}
+
 /** A dashboard's tabs in display order. */
 function orderedTabs(tabs: any[] | undefined): any[] {
   return [...(tabs || [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
@@ -449,32 +507,8 @@ export class MetabaseClient {
   ): Promise<any> {
     const current: any = await this.getDashboard(dashboardId);
     const currentTabs = orderedTabs(current.tabs);
-    const currentIds = new Set(currentTabs.map((t: any) => t.id));
     const dashcards: any[] = current.dashcards || [];
-
-    // Ids for the new list: existing tabs keep theirs, new ones get negative ids.
-    const taken = new Set<number>();
-    for (const t of tabs) {
-      if (t.id === undefined) continue;
-      if (t.id === 0) throw new Error('Tab id 0 is not valid: omit the id for a new tab');
-      if (t.id > 0 && !currentIds.has(t.id)) {
-        throw new Error(`Tab ${t.id} is not in dashboard ${dashboardId}. Tabs: ${tabList(currentTabs)}`);
-      }
-      if (taken.has(t.id)) throw new Error(`Tab ${t.id} appears twice in the list`);
-      taken.add(t.id);
-    }
-    let nextNew = -1;
-    const nextTabs = tabs.map((t) => {
-      const name = (t.name || '').trim();
-      if (!name) throw new Error('Every tab needs a name');
-      let id = t.id;
-      if (id === undefined) {
-        while (taken.has(nextNew)) nextNew--;
-        id = nextNew;
-        taken.add(id);
-      }
-      return { id, name };
-    });
+    const nextTabs = resolveTabs(dashboardId, currentTabs, tabs);
 
     const keptIds = new Set(nextTabs.filter((t) => t.id > 0).map((t) => t.id));
     const deleted = currentTabs.filter((t: any) => !keptIds.has(t.id));
@@ -532,6 +566,121 @@ export class MetabaseClient {
     // New tabs only get their real ids from Metabase: read them back.
     const after: any = await this.getDashboard(dashboardId);
     result.tabs = orderedTabs(after.tabs).map((t: any) => ({ id: t.id, name: t.name, position: t.position }));
+    return result;
+  }
+
+  /**
+   * Writes a dashboard's whole layout in one PUT: tabs, every dashcard and,
+   * optionally, the filters and width. `dashcards` is the COMPLETE list: a
+   * positive id keeps that dashcard, a negative one creates it, and a current
+   * dashcard missing from the list is deleted, which needs `confirmRemovals`
+   * (as does deleting a tab). Text and heading cards can be written short, as
+   * {id, text, display: "text" | "heading", ...}.
+   *
+   * Everything is validated before writing: grid bounds (24 columns), tabs,
+   * unique ids, text cards, and filter mappings against the filters that will
+   * be in place. With `dryRun` it returns the diff, what would be removed and
+   * the payload, without writing.
+   */
+  async putDashboardLayout(
+    dashboardId: number,
+    layout: { tabs?: { id?: number; name: string }[]; dashcards: any[]; parameters?: any[]; width?: 'fixed' | 'full' },
+    opts: { dryRun?: boolean; confirmRemovals?: boolean } = {},
+  ): Promise<any> {
+    const current: any = await this.getDashboard(dashboardId);
+    const currentTabs = orderedTabs(current.tabs);
+    const currentDashcards: any[] = current.dashcards || [];
+
+    const nextTabs = layout.tabs ? resolveTabs(dashboardId, currentTabs, layout.tabs) : currentTabs.map((t: any) => ({ id: t.id, name: t.name }));
+    const tabIds = new Set(nextTabs.map((t: any) => t.id));
+    const parameters: any[] = layout.parameters ?? current.parameters ?? [];
+    const paramIds = new Set(parameters.map((p: any) => p.id));
+    const currentDashcardIds = new Set(currentDashcards.map((dc) => dc.id));
+
+    const errors: string[] = [];
+    const seen = new Set<number>();
+    const dashcards = layout.dashcards.map((raw: any) => expandTextCard(raw));
+
+    for (const dc of dashcards) {
+      const label = `dashcard ${dc.id}`;
+      if (typeof dc.id !== 'number' || dc.id === 0) {
+        errors.push(`${label}: id must be a positive (existing) or negative (new) number`);
+        continue;
+      }
+      if (seen.has(dc.id)) errors.push(`${label}: id appears twice`);
+      seen.add(dc.id);
+      if (dc.id > 0 && !currentDashcardIds.has(dc.id)) {
+        errors.push(`${label}: not on the dashboard (use a negative id for a new dashcard)`);
+      }
+
+      const { row, col, size_x, size_y } = dc;
+      if (![row, col, size_x, size_y].every((n) => Number.isInteger(n))) {
+        errors.push(`${label}: row, col, size_x and size_y are required integers`);
+      } else {
+        if (col < 0 || row < 0) errors.push(`${label}: row and col must be >= 0`);
+        if (size_x < 1 || size_y < 1) errors.push(`${label}: size_x and size_y must be >= 1`);
+        if (col + size_x > GRID_COLUMNS) errors.push(`${label}: col + size_x = ${col + size_x}, past the ${GRID_COLUMNS}-column grid`);
+      }
+
+      if (nextTabs.length > 0) {
+        if (dc.dashboard_tab_id === undefined || dc.dashboard_tab_id === null) {
+          errors.push(`${label}: needs dashboard_tab_id (tabs: ${tabList(nextTabs)})`);
+        } else if (!tabIds.has(dc.dashboard_tab_id)) {
+          errors.push(`${label}: tab ${dc.dashboard_tab_id} is not in the layout (tabs: ${tabList(nextTabs)})`);
+        }
+      }
+
+      const isVirtual = dc.card_id === null || dc.card_id === undefined;
+      if (isVirtual && !dc.visualization_settings?.virtual_card?.display) {
+        errors.push(`${label}: a card without card_id needs visualization_settings.virtual_card.display (text, heading...), or use {text, display}`);
+      }
+
+      for (const m of dc.parameter_mappings || []) {
+        if (!paramIds.has(m.parameter_id)) {
+          errors.push(`${label}: maps filter "${m.parameter_id}", which is not among the dashboard filters (${[...paramIds].join(', ') || 'none'})`);
+        }
+        if (m.card_id !== dc.card_id) {
+          errors.push(`${label}: mapping for "${m.parameter_id}" has card_id ${m.card_id}, but the dashcard shows card ${dc.card_id}`);
+        }
+      }
+    }
+    if (errors.length) {
+      throw new Error(`Layout for dashboard ${dashboardId} is not valid:\n- ${errors.join('\n- ')}`);
+    }
+
+    const keptDashcards = new Set(dashcards.filter((dc) => dc.id > 0).map((dc) => dc.id));
+    const removedDashcards = currentDashcards
+      .filter((dc) => !keptDashcards.has(dc.id))
+      .map((dc) => ({ id: dc.id, card_id: dc.card_id ?? null, name: dashcardLabel(dc), tab: dc.dashboard_tab_id ?? null }));
+    const keptTabs = new Set(nextTabs.filter((t: any) => t.id > 0).map((t: any) => t.id));
+    const removedTabs = currentTabs.filter((t: any) => !keptTabs.has(t.id)).map((t: any) => ({ id: t.id, name: t.name }));
+    const removals = { dashcards: removedDashcards, tabs: removedTabs };
+    const removesSomething = removedDashcards.length > 0 || removedTabs.length > 0;
+
+    if (removesSomething && !opts.confirmRemovals && !opts.dryRun) {
+      const parts = [
+        ...removedDashcards.map((d) => `dashcard ${d.id} (${d.name})`),
+        ...removedTabs.map((t) => `tab ${t.id} (${t.name})`),
+      ];
+      throw new Error(
+        `This layout deletes ${parts.length} item(s) from dashboard ${dashboardId}: ${parts.join(', ')}. Pass confirm_removals: true to apply it, or include them in the layout.`
+      );
+    }
+
+    const body: any = { tabs: nextTabs, dashcards };
+    if (layout.parameters !== undefined) body.parameters = layout.parameters;
+    if (layout.width !== undefined) body.width = layout.width;
+
+    const result: any = await this.putDashboardSafe(dashboardId, body, { current, dryRun: opts.dryRun });
+    result.removals = removals;
+    if (opts.dryRun) {
+      result.tabs = nextTabs;
+      if (removesSomething) result.needs_confirm_removals = true;
+      return result;
+    }
+    const after: any = await this.getDashboard(dashboardId);
+    result.tabs = orderedTabs(after.tabs).map((t: any) => ({ id: t.id, name: t.name, position: t.position }));
+    result.dashcards = (after.dashcards || []).length;
     return result;
   }
 

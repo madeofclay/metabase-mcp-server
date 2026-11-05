@@ -466,6 +466,65 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
   });
 
   server.addTool({
+    name: "put_dashboard_layout",
+    description:
+      "Write a dashboard's WHOLE layout in one atomic call: tabs, every card and text block, and optionally filters and width. dashcards is the COMPLETE list: positive id = existing dashcard (kept/moved), negative id = new one; any current dashcard missing from the list is DELETED and needs confirm_removals: true (same for tabs). New tabs use negative ids that dashcards reference in dashboard_tab_id. Text/heading blocks can be given as {id: -n, text: '## ...', display: 'text'|'heading', dashboard_tab_id, row, col, size_x, size_y}. Validates before writing (24-column grid, tabs, unique ids, filter mappings). Use dry_run: true first to see the diff and what would be removed. Returns real tab ids and previous_revision_id to undo with revert_dashboard.",
+    metadata: { isWrite: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      tabs: z
+        .array(z.object({
+          id: z.number().optional().describe("Existing tab id, or a negative id for a new tab (needed if dashcards point at it)"),
+          name: z.string().min(1).describe("Tab name"),
+        }).strict())
+        .optional()
+        .describe("Every tab, in display order. Omit to keep the current tabs"),
+      dashcards: z
+        .array(z.object({
+          id: z.number().describe("Dashcard id: positive = existing, negative = new"),
+          card_id: z.number().nullable().optional().describe("Saved question shown; null/omitted for text and heading blocks"),
+          dashboard_tab_id: z.number().optional().describe("Tab id (required when the dashboard has tabs)"),
+          row: z.number().describe("Row (0 = top)"),
+          col: z.number().describe("Column, 0-23"),
+          size_x: z.number().describe("Width in columns; col + size_x <= 24"),
+          size_y: z.number().describe("Height in rows"),
+          text: z.string().optional().describe("Shorthand for a text block: its Markdown"),
+          display: z.enum(["text", "heading"]).optional().describe("With text: block kind (default text)"),
+          parameter_mappings: z.array(z.object({}).passthrough()).optional().describe("Filter mappings: {parameter_id, card_id, target}"),
+          visualization_settings: z.object({}).passthrough().optional(),
+          series: z.array(z.object({}).passthrough()).optional(),
+          inline_parameters: z.array(z.unknown()).optional(),
+          action_id: z.number().nullable().optional(),
+        }).passthrough())
+        .describe("Every dashcard the dashboard should have"),
+      parameters: z
+        .array(z.object({}).passthrough())
+        .optional()
+        .describe("Full filter definitions; omit to keep the current filters"),
+      width: z.enum(["fixed", "full"]).optional().describe("Dashboard width"),
+      dry_run: z.boolean().optional().describe("Validate and show the diff without writing"),
+      confirm_removals: z.boolean().optional().describe("Required when the layout deletes dashcards or tabs"),
+    }).strict(),
+    execute: async (args: any, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const { dashboard_id, dry_run, confirm_removals, ...layout } = args;
+        const result = await metabaseClient.putDashboardLayout(dashboard_id, layout, {
+          dryRun: dry_run,
+          confirmRemovals: confirm_removals,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to write the layout of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
+  server.addTool({
     name: "manage_dashboard_tabs",
     description:
       "Create, rename, reorder or delete a dashboard's tabs in one call. Pass the FULL list of tabs in the desired order: a tab without id is created, an existing tab missing from the list is deleted. Cards are never deleted silently: if a deleted tab has cards, pass move_cards_from_deleted_to (a tab id from the new list, or its position, 0 = first). A dashboard without tabs that gets tabs moves all its cards to the first one. Removing every tab needs confirm: true. Use dry_run: true to preview. Returns the tabs with their real ids, what moved, and previous_revision_id to undo with revert_dashboard.",
