@@ -301,35 +301,6 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
   });
 
   /**
-   * See a card the way Metabase draws it (static PNG, as in subscriptions), to
-   * check visually what run_dashcards can only check from the data.
-   */
-  server.addTool({
-    name: "preview_card",
-    description: "Render a saved card as an image (PNG) the way Metabase draws it in dashboard subscriptions, to check visually that a chart renders and reads well. It runs the question with its defaults: dashboard filters and dashcard overrides do not apply. A chart that cannot be drawn returns an error here. Use it on cards run_dashcards flags, or on any new chart before sharing.",
-    metadata: { isRead: true, isEssential: true },
-    parameters: z.object({
-      card_id: z.number().describe("Card ID"),
-    }).strict(),
-    execute: async (args: { card_id: number }, context: any) => {
-      const metabaseClient = getClient(context);
-      try {
-        const png = await metabaseClient.previewCardPng(args.card_id);
-        return {
-          content: [
-            { type: "text" as const, text: `Card ${args.card_id} rendered by Metabase (${Math.round(png.bytes / 1024)} KB PNG).` },
-            { type: "image" as const, data: png.base64, mimeType: "image/png" },
-          ],
-        };
-      } catch (error) {
-        throw new Error(
-          `Failed to render card ${args.card_id}: ${error instanceof Error ? error.message : "Unknown error"}`
-        );
-      }
-    },
-  });
-
-  /**
    * Export Metabase card results in specific format
    * 
    * Executes a card and exports the results in a specific format (CSV, Excel, JSON, etc.).
