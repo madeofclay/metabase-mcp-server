@@ -130,6 +130,25 @@ export async function metabaseSessionFromGoogle(metabaseUrl: string, idToken: st
 }
 
 /**
+ * Ends a session in Metabase. A session lives MAX_SESSION_AGE however often it
+ * is replaced, so renewing without this would only add live sessions. Best
+ * effort: returns false when Metabase could not be told.
+ */
+export async function metabaseLogout(metabaseUrl: string, session: string): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl(metabaseUrl, '/api/session'), {
+      method: 'DELETE',
+      headers: { 'X-Metabase-Session': session },
+      signal: AbortSignal.timeout(5000),
+    });
+    // 401: the session was already gone, which is the goal anyway.
+    return res.ok || res.status === 401;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Whether Metabase still honours a session: true or false when it says so,
  * undefined when it could not be asked (network error, 5xx).
  */

@@ -31,8 +31,9 @@
  *   GOOGLE_CLIENT_ID       Metabase's Google OAuth client id (enables the flow)
  *   GOOGLE_CLIENT_SECRET   Its secret (env var or vault key METABASE_MCP_GOOGLE_CLIENT_SECRET)
  *   GOOGLE_REDIRECT_URI    Callback registered in that client (default: GATEWAY_URL/oauth/google/callback)
- *   METABASE_SESSION_RENEW_DAYS  Renew a session this old on refresh (default: 12,
- *                          below Metabase's 14-day MAX_SESSION_AGE default)
+ *   METABASE_SESSION_RENEW_DAYS  Renew a session this old on refresh, ending the
+ *                          previous one (default: 1). Bounds how long a leaked
+ *                          session stays usable, instead of Metabase's 14 days.
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -48,6 +49,7 @@ import {
   MetabaseRejected,
   exchangeGoogleCode,
   googleAuthUrl,
+  metabaseLogout,
   metabaseSessionAlive,
   metabaseSessionFromGoogle,
   refreshGoogleIdToken,
@@ -123,7 +125,7 @@ async function loadGoogleConfig(): Promise<GoogleConfig | null> {
 const GOOGLE = await loadGoogleConfig();
 log('info', `Server-side Google sign-in ${GOOGLE ? `enabled (callback ${GOOGLE.redirectUri})` : 'disabled'}`);
 
-const SESSION_RENEW_AFTER_S = Math.round(parseFloat(process.env.METABASE_SESSION_RENEW_DAYS || '12') * 86400);
+const SESSION_RENEW_AFTER_S = Math.round(parseFloat(process.env.METABASE_SESSION_RENEW_DAYS || '1') * 86400);
 
 // ── Pending authorization codes (in-memory, 10-min TTL) ─────────────────────
 
@@ -805,7 +807,8 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
 // default), however often it is used. Rotating our own tokens does not help once
 // that happens: every tool call fails until the user signs in again. So each
 // refresh also checks the Metabase session, and renews it from the Google refresh
-// token when it is old or already rejected.
+// token when it is older than a day or already rejected — ending the previous one,
+// so no session lives much past a day.
 
 /** The Metabase session is gone and cannot be renewed: the user must sign in again. */
 class SessionGone extends Error {}
@@ -817,7 +820,9 @@ const RETRY_ACCESS_EXPIRY = '5m';
 async function renewMetabaseSession(creds: Credentials, sub: string, reason: string): Promise<Credentials> {
   const google = await refreshGoogleIdToken(GOOGLE!, creds.google_refresh_token!);
   const session = await metabaseSessionFromGoogle(creds.metabase_url, google.idToken);
-  log('info', `metabase session renewed sub=${sub} reason=${reason}`);
+  // Renewing only narrows exposure if the replaced session stops working too.
+  const ended = await metabaseLogout(creds.metabase_url, creds.metabase_session_token!);
+  log(ended ? 'info' : 'warn', `metabase session renewed sub=${sub} reason=${reason} previous_ended=${ended}`);
   return {
     ...creds,
     metabase_session_token: session,

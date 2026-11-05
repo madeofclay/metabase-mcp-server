@@ -30,7 +30,9 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    `src/google-sso.ts`) con el cliente OAuth de Google **del propio Metabase** y acceso
    offline. Así el gateway guarda un refresh token de Google y, en cada refresh del
    JWT, revisa la sesión de Metabase y la renueva (`/api/session/google_auth`) si tiene
-   más de `METABASE_SESSION_RENEW_DAYS` (12) o Metabase ya la rechaza. Metabase vence
+   más de `METABASE_SESSION_RENEW_DAYS` (1) o Metabase ya la rechaza, y **cierra la
+   anterior** (`DELETE /api/session`): una sesión vale sus 14 días aunque se reemplace,
+   así que sin cerrarla renovar seguido no acortaría nada. Metabase vence
    cada sesión a los 14 días (`MAX_SESSION_AGE`) y antes la conexión moría ahí sin
    remedio (IAD-1210). Una sesión muerta que no se puede renovar hace fallar el
    refresh con `invalid_grant`, para que Claude pida reconectar en vez de fallar en

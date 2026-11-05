@@ -17,6 +17,7 @@ const CLIENT_REDIRECT = 'https://client.example.com/callback';
 const fake = {
   googleRefreshFails: '' as '' | 'invalid_grant' | 'server_error',
   metabaseRejectsGoogle: false,
+  logoutFails: false,
   deadSessions: new Set<string>(),
   sessionsIssued: 0,
   calls: [] as string[],
@@ -49,6 +50,13 @@ const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
     fake.sessionsIssued += 1;
     return json(200, { id: `session-${fake.sessionsIssued}` });
   }
+  if (url === `${METABASE}/api/session` && init?.method === 'DELETE') {
+    const session = (init?.headers as Record<string, string>)['X-Metabase-Session'];
+    fake.calls.push(`metabase:logout:${session}`);
+    if (fake.logoutFails) throw new Error('connection reset');
+    fake.deadSessions.add(session);
+    return new Response(null, { status: 204 });
+  }
   if (url === `${METABASE}/api/user/current`) {
     fake.calls.push('metabase:user_current');
     const session = (init?.headers as Record<string, string>)['X-Metabase-Session'];
@@ -70,6 +78,7 @@ function decode(token: string): Record<string, any> {
 beforeEach(() => {
   fake.googleRefreshFails = '';
   fake.metabaseRejectsGoogle = false;
+  fake.logoutFails = false;
   fake.deadSessions.clear();
   fake.calls = [];
 });
@@ -196,7 +205,7 @@ describe('Metabase session renewal on refresh', () => {
   const googleCreds = (extra: Record<string, any> = {}) => ({
     metabase_url: METABASE,
     metabase_session_token: 'session-old',
-    metabase_session_issued_at: now() - 86400,
+    metabase_session_issued_at: now() - 3600,
     google_refresh_token: 'g-refresh-1',
     google_subject: 'google-user-1',
     ...extra,
@@ -219,10 +228,29 @@ describe('Metabase session renewal on refresh', () => {
     expect(res.body.expires_in).toBe(8 * 3600);
   });
 
-  it('renews a session before Metabase’s 14-day limit, without waiting for it to fail', async () => {
-    const res = await refresh(refreshTokenFor(googleCreds({ metabase_session_issued_at: now() - 13 * 86400 })));
+  it('renews a session once it is a day old, without waiting for it to fail', async () => {
+    const res = await refresh(refreshTokenFor(googleCreds({ metabase_session_issued_at: now() - 86400 })));
     expect(decode(res.body.access_token).metabase_session_token).not.toBe('session-old');
     expect(fake.calls).not.toContain('metabase:user_current');
+  });
+
+  it('ends the replaced session, so renewing narrows exposure instead of adding sessions', async () => {
+    await refresh(refreshTokenFor(googleCreds({ metabase_session_issued_at: now() - 86400 })));
+    expect(fake.calls).toContain('metabase:logout:session-old');
+    expect(fake.deadSessions.has('session-old')).toBe(true);
+  });
+
+  it('still hands out the new session when the old one could not be ended', async () => {
+    fake.logoutFails = true;
+    const res = await refresh(refreshTokenFor(googleCreds({ metabase_session_issued_at: now() - 86400 })));
+    expect(res.status).toBe(200);
+    expect(decode(res.body.access_token).metabase_session_token).not.toBe('session-old');
+  });
+
+  it('does not end the current session when renewal failed', async () => {
+    fake.googleRefreshFails = 'server_error';
+    await refresh(refreshTokenFor(googleCreds({ metabase_session_issued_at: now() - 86400 })));
+    expect(fake.calls).not.toContain('metabase:logout:session-old');
   });
 
   it('keeps the same log subject when the session changes', async () => {
