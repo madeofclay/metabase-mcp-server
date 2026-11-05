@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { MetabaseClient } from "../client/metabase-client.js";
 import { TagOverride, buildTemplateTags, tagObject } from "../utils/template-tags.js";
+import { cardOutput } from "../utils/compact-result.js";
 
 const TEMPLATE_TAGS_PARAM = z
   .record(z.object({
@@ -118,6 +119,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
         .passthrough()
         .optional()
         .describe("Visualization settings object"),
+      include_full: z.boolean().optional().describe("Return the whole card instead of a summary (id, columns, template tags, chart checks)"),
     }),
     execute: async (args: any, context: any) => {
       const metabaseClient = getClient(context);
@@ -136,7 +138,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
         if (args.collection_id != null) payload.collection_id = args.collection_id;
 
         const card = await metabaseClient.createCard(payload);
-        return JSON.stringify(card, null, 2);
+        return cardOutput(card, args.include_full);
       } catch (error) {
         throw new Error(
           `Failed to create card: ${error instanceof Error ? error.message : "Unknown error"}`
@@ -171,8 +173,10 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
         .passthrough()
         .optional()
         .describe("Optional query parameters for update"),
+      include_full: z.boolean().optional().describe("Return the whole card instead of a summary (id, columns, template tags, chart checks)"),
     }).strict(),
     execute: async (args: {
+      include_full?: boolean;
       card_id: number;
       updates?: any;
       sql?: string;
@@ -183,7 +187,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
       try {
         if (args.sql !== undefined) {
           const result = await metabaseClient.updateCardSql(args.card_id, args.sql, args.template_tags, args.updates);
-          return JSON.stringify(result, null, 2);
+          return cardOutput(result, args.include_full);
         }
         if (args.template_tags) throw new Error("template_tags needs sql");
         if (!args.updates) throw new Error("Pass updates or sql");
@@ -192,7 +196,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
           args.updates,
           args.query_params
         );
-        return JSON.stringify(card, null, 2);
+        return cardOutput(card, args.include_full);
       } catch (error) {
         throw new Error(
           `Failed to update card ${args.card_id}: ${error instanceof Error ? error.message : "Unknown error"}`
@@ -291,6 +295,35 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
       } catch (error) {
         throw new Error(
           `Failed to execute card ${args.card_id}: ${error instanceof Error ? error.message : "Unknown error"}`
+        );
+      }
+    },
+  });
+
+  /**
+   * See a card the way Metabase draws it (static PNG, as in subscriptions), to
+   * check visually what run_dashcards can only check from the data.
+   */
+  server.addTool({
+    name: "preview_card",
+    description: "Render a saved card as an image (PNG) the way Metabase draws it in dashboard subscriptions, to check visually that a chart renders and reads well. It runs the question with its defaults: dashboard filters and dashcard overrides do not apply. A chart that cannot be drawn returns an error here. Use it on cards run_dashcards flags, or on any new chart before sharing.",
+    metadata: { isRead: true, isEssential: true },
+    parameters: z.object({
+      card_id: z.number().describe("Card ID"),
+    }).strict(),
+    execute: async (args: { card_id: number }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const png = await metabaseClient.previewCardPng(args.card_id);
+        return {
+          content: [
+            { type: "text" as const, text: `Card ${args.card_id} rendered by Metabase (${Math.round(png.bytes / 1024)} KB PNG).` },
+            { type: "image" as const, data: png.base64, mimeType: "image/png" },
+          ],
+        };
+      } catch (error) {
+        throw new Error(
+          `Failed to render card ${args.card_id}: ${error instanceof Error ? error.message : "Unknown error"}`
         );
       }
     },

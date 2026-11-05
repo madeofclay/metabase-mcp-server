@@ -9,6 +9,8 @@
  * dry run, the full payload) only when include_dashboard is true.
  */
 
+import { validateVisualization, columnsOf } from './viz-validation.js';
+
 const TEXT_PREVIEW = 60;
 
 function tabSummary(tabs: any[] = [], dashcards: any[] = []) {
@@ -104,4 +106,66 @@ export function compactResult(result: any, includeDashboard = false): any {
 /** JSON for a tool result, compacted when it is a dashboard write. */
 export function toolOutput(result: any, includeDashboard = false): string {
   return JSON.stringify(compactResult(result, includeDashboard), null, 2);
+}
+
+// ── Cards and dashboards read back ──────────────────────────────────────────
+
+
+function templateTagsOf(card: any): { name: string; type: string }[] {
+  const dq = card?.dataset_query || {};
+  const raw = dq.stages?.[0]?.['template-tags'] ?? dq.native?.['template-tags'] ?? [];
+  const tags = Array.isArray(raw) ? raw : Object.values(raw);
+  return tags.map((t: any) => ({ name: t.name, type: t.type }));
+}
+
+/**
+ * A card reduced to what a caller needs after creating or editing it, plus a
+ * check of its visualization against the columns its query returns. Warnings
+ * here catch, at creation time, a trend card without a date column and the like.
+ */
+export function cardSummary(card: any) {
+  if (!card || typeof card !== 'object' || card.id === undefined) return card;
+  const cols = columnsOf(card);
+  const out: any = {
+    id: card.id,
+    name: card.name,
+    display: card.display,
+    collection_id: card.collection_id,
+    database_id: card.database_id,
+    query_type: card.query_type,
+    template_tags: templateTagsOf(card),
+    columns: cols.map((c) => ({ name: c.name, type: c.effective_type || c.base_type })),
+    dashboard_count: card.dashboard_count,
+  };
+  if (cols.length) {
+    const viz = validateVisualization(card.display, card.visualization_settings, cols);
+    if (viz.errors.length) out.chart_errors = viz.errors;
+    if (viz.warnings.length) out.chart_warnings = viz.warnings;
+  }
+  return out;
+}
+
+/** create_card / update_card output: a card summary unless includeFull. */
+export function cardOutput(result: any, includeFull = false): string {
+  if (includeFull) return JSON.stringify(result, null, 2);
+  if (result && typeof result === 'object' && result.card && result.format) {
+    // update_card with sql: { card, template_tags, format }
+    return JSON.stringify({ ...result, card: cardSummary(result.card), note: 'Summary only; pass include_full: true for the whole card.' }, null, 2);
+  }
+  return JSON.stringify({ ...cardSummary(result), note: 'Summary only; pass include_full: true for the whole card.' }, null, 2);
+}
+
+/** get_dashboard output: the summary plus one line per dashcard, unless includeFull. */
+export function dashboardOutput(d: any, includeFull = false): string {
+  if (includeFull || !d || typeof d !== 'object') return JSON.stringify(d, null, 2);
+  const tabsOrder = new Map<number, number>((d.tabs || []).map((t: any) => [t.id, t.position ?? 0]));
+  const dashcards = [...(d.dashcards || [])].sort((a: any, b: any) =>
+    (tabsOrder.get(a.dashboard_tab_id) ?? 0) - (tabsOrder.get(b.dashboard_tab_id) ?? 0) || a.row - b.row || a.col - b.col);
+  return JSON.stringify({
+    ...dashboardSummary(d),
+    description: d.description,
+    filters: (d.parameters || []).map((p: any) => ({ id: p.id, name: p.name, slug: p.slug, type: p.type, default: p.default })),
+    cards: dashcards.map(dashcardSummary),
+    note: 'Summary only; pass include_full: true for the whole dashboard (every card, query and setting).',
+  }, null, 2);
 }

@@ -34,7 +34,7 @@ const READ = [
   'get_database_metadata', 'list_database_schemas', 'get_database_schema',
   'execute_query', 'test_native_query',
   // cards
-  'list_cards', 'get_card', 'execute_card', 'export_card_result', 'get_card_dashboards',
+  'list_cards', 'get_card', 'execute_card', 'preview_card', 'export_card_result', 'get_card_dashboards',
   'list_embeddable_cards', 'list_public_cards', 'execute_pivot_card_query',
   'get_card_param_values', 'search_card_param_values', 'get_card_param_remapping',
   'get_card_query_metadata', 'get_card_series',

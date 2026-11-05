@@ -12,13 +12,13 @@ const dashboard = () => ({
   parameters: PARAMS,
   tabs: [{ id: 11, name: 'Cambios', position: 1 }, { id: 10, name: 'Ranking', position: 0 }],
   dashcards: [
-    { id: 3, card_id: 6608, dashboard_tab_id: 11, row: 0, col: 0, card: { name: 'Tiers' }, parameter_mappings: [m('f_mes', 6608, 'p_mes')] },
-    { id: 2, card_id: 6601, dashboard_tab_id: 10, row: 2, col: 6, card: { name: 'Clientes' },
+    { id: 3, card_id: 6608, dashboard_tab_id: 11, row: 0, col: 0, card: { name: 'Tiers', display: 'table', dataset_query: { database: 40, _card: 6608 } }, parameter_mappings: [m('f_mes', 6608, 'p_mes')] },
+    { id: 2, card_id: 6601, dashboard_tab_id: 10, row: 2, col: 6, card: { name: 'Clientes', display: 'table', dataset_query: { database: 40, _card: 6601 } },
       visualization_settings: { 'card.hide_empty': true },
       parameter_mappings: [m('f_mes', 6601, 'p_mes'), m('f_tier', 6601, 'p_tier')] },
-    { id: 1, card_id: 6600, dashboard_tab_id: 10, row: 0, col: 16, card: { name: 'Mes que estás viendo' }, parameter_mappings: [m('f_mes', 6600, 'p_mes')] },
+    { id: 1, card_id: 6600, dashboard_tab_id: 10, row: 0, col: 16, card: { name: 'Mes que estás viendo', display: 'table', dataset_query: { database: 40, _card: 6600 } }, parameter_mappings: [m('f_mes', 6600, 'p_mes')] },
     { id: 4, card_id: null, dashboard_tab_id: 10, row: 0, col: 0, visualization_settings: { virtual_card: { display: 'text' }, text: '## T' } },
-    { id: 5, card_id: 6612, dashboard_tab_id: 11, row: 5, col: 0, card: { name: 'Rota' }, parameter_mappings: [] },
+    { id: 5, card_id: 6612, dashboard_tab_id: 11, row: 5, col: 0, card: { name: 'Rota', display: 'table', dataset_query: { database: 40, _card: 6612 } }, parameter_mappings: [] },
   ],
 });
 
@@ -33,8 +33,9 @@ function client(answers: Record<number, any> = {}) {
     maxInFlight = Math.max(maxInFlight, inFlight);
     await new Promise((r) => setTimeout(r, 5));
     inFlight--;
-    if (url === '/api/dataset') return answers[0];
-    const cid = Number(/card\/(\d+)\/query$/.exec(url)![1]);
+    if (url === '/api/dataset' && body?._card === undefined) return answers[0];
+    // runDashcards runs each card's own query ad hoc; _card marks which one.
+    const cid = url === '/api/dataset' ? body._card : Number(/card\/(\d+)\/query$/.exec(url)![1]);
     const answer = answers[cid] ?? { status: 'completed', data: { rows: [[1], [2]] } };
     if (answer instanceof Error) throw answer;
     return { data: answer };
@@ -43,40 +44,44 @@ function client(answers: Record<number, any> = {}) {
 }
 
 describe('runDashcards', () => {
-  it('runs every question in tab → row → col order through the dashcard endpoint, skipping text', async () => {
+  const ran = (ax: any) => ax.post.mock.calls.map(([, body]: [string, any]) => body._card);
+
+  it('runs every question in tab → row → col order as an ad hoc query, skipping text', async () => {
     const { c, ax } = client();
     const result = await c.runDashcards(621);
-    expect(ax.post.mock.calls.map(([url]: [string]) => url)).toEqual([
-      '/api/dashboard/621/dashcard/1/card/6600/query',
-      '/api/dashboard/621/dashcard/2/card/6601/query',
-      '/api/dashboard/621/dashcard/3/card/6608/query',
-      '/api/dashboard/621/dashcard/5/card/6612/query',
-    ]);
+    expect(ran(ax)).toEqual([6600, 6601, 6608, 6612]);
+    expect(ax.post.mock.calls.every(([url]: [string]) => url === '/api/dataset')).toBe(true);
     expect(result.cards[0]).toEqual({
-      tab: 'Ranking', dashcard_id: 1, card_id: 6600, name: 'Mes que estás viendo', hide_empty: false, status: 'ok', rows: 2,
+      tab: 'Ranking', dashcard_id: 1, card_id: 6600, name: 'Mes que estás viendo', display: 'table', hide_empty: false, status: 'ok', rows: 2,
     });
     // Without values nothing is sent.
     expect(ax.post.mock.calls.every(([, body]: [string, any]) => body.parameters.length === 0)).toBe(true);
   });
 
+  it("never calls the dashcard endpoint, which would save the values as the user's last-used filters", async () => {
+    const { c, ax } = client();
+    await c.runDashcards(621, { values: { f_mes: '2026-12' } });
+    expect(ax.post.mock.calls.some(([url]: [string]) => url.includes('/dashcard/'))).toBe(false);
+  });
+
   it('sends only the mapped filters that have a value, with the dashboard filter type', async () => {
     const { c, ax } = client();
     await c.runDashcards(621, { values: { f_mes: '2026-12', f_tier: 'Muy Alta' } });
-    const bodyFor = (dc: number) => ax.post.mock.calls.find(([u]: [string]) => u.includes(`/dashcard/${dc}/`))[1];
-    expect(bodyFor(2).parameters).toEqual([
+    const bodyFor = (cid: number) => ax.post.mock.calls.find(([, b]: [string, any]) => b._card === cid)[1];
+    expect(bodyFor(6601).parameters).toEqual([
       { id: 'f_mes', type: 'date/month-year', target: ['variable', ['template-tag', 'p_mes']], value: '2026-12' },
       { id: 'f_tier', type: 'string/=', target: ['variable', ['template-tag', 'p_tier']], value: ['Muy Alta'] },
     ]);
-    expect(bodyFor(1).parameters).toEqual([
+    expect(bodyFor(6600).parameters).toEqual([
       { id: 'f_mes', type: 'date/month-year', target: ['variable', ['template-tag', 'p_mes']], value: '2026-12' },
     ]);
-    expect(bodyFor(5).parameters).toEqual([]);
+    expect(bodyFor(6612).parameters).toEqual([]);
   });
 
   it('keeps a list value for string filters as it comes', async () => {
     const { c, ax } = client();
     await c.runDashcards(621, { values: { f_tier: ['Alta', 'Media'] } });
-    const body = ax.post.mock.calls.find(([u]: [string]) => u.includes('/dashcard/2/'))[1];
+    const body = ax.post.mock.calls.find(([, b]: [string, any]) => b._card === 6601)[1];
     expect(body.parameters[0].value).toEqual(['Alta', 'Media']);
   });
 
@@ -92,7 +97,22 @@ describe('runDashcards', () => {
     expect(byId[3].status).toBe('error');
     expect(byId[3].error.length).toBeLessThanOrEqual(301);
     expect(byId[5]).toMatchObject({ status: 'error', error: 'column "nicho" does not exist' });
-    expect(result.totals).toEqual({ ok: 1, empty: 1, errors: 2 });
+    expect(result.totals).toEqual({ ok: 1, empty: 1, chart_errors: 0, errors: 2 });
+  });
+
+  it('flags a card whose result does not fit its chart, though the query runs', async () => {
+    const { c } = client({
+      6601: { status: 'completed', data: { rows: [[1, 2]], cols: [{ name: 'Tier', base_type: 'type/Text' }, { name: 'Clientes', base_type: 'type/Integer' }] } },
+    });
+    const d = dashboard();
+    d.dashcards[1].card = { name: 'Clientes', display: 'smartscalar', dataset_query: { database: 40, _card: 6601 } } as any;
+    (c as any).axiosInstance.get = vi.fn(async () => ({ data: d }));
+    const result = await c.runDashcards(621);
+    const card = result.cards.find((r: any) => r.dashcard_id === 2);
+    expect(card.status).toBe('chart_error');
+    expect(card.chart_errors[0]).toMatch(/trend card needs a date column/);
+    expect(result.totals.chart_errors).toBe(1);
+    expect(result.checks).toMatch(/preview_card/);
   });
 
   it('runs one tab, by name or id', async () => {

@@ -3,7 +3,8 @@
  * Handles all API interactions with Metabase
  */
 
-import { explainMetabaseError } from "../utils/metabase-errors.js";
+import { explainMetabaseError, metabaseDetail } from "../utils/metabase-errors.js";
+import { validateVisualization, effectiveSettings, columnsOf } from "../utils/viz-validation.js";
 import axios, { AxiosInstance } from "axios";
 import { ErrorCode, McpError } from "../types/errors.js";
 import {
@@ -139,6 +140,42 @@ function orderedTabs(tabs: any[] | undefined): any[] {
   return [...(tabs || [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 }
 
+/**
+ * The real id Metabase gave each new (negative id) dashcard of a layout. Metabase
+ * does not echo the temporary ids, so each new dashcard is matched, after the
+ * write, to the stored one in the same tab, position, size and card. Tabs match
+ * by position: the layout's tab list and the stored one are in the same order.
+ */
+export function createdDashcardIds(
+  layoutTabs: any[],
+  storedTabs: any[],
+  layoutDashcards: any[],
+  storedDashcards: any[],
+): { temp_id: number; id: number | null; card_id: number | null; tab: number | null }[] {
+  const tabOf = new Map<number, number>();
+  layoutTabs.forEach((t: any, i: number) => {
+    if (storedTabs[i]) tabOf.set(t.id, storedTabs[i].id);
+  });
+  const layoutIds = new Set(layoutDashcards.map((dc) => dc.id));
+  const taken = new Set<number>();
+  // Existing dashcards keep their ids; only stored ones not in the layout are new.
+  const candidates = storedDashcards.filter((s) => !layoutIds.has(s.id));
+  return layoutDashcards
+    .filter((dc) => typeof dc.id === 'number' && dc.id < 0)
+    .map((dc) => {
+      const tab = dc.dashboard_tab_id === undefined || dc.dashboard_tab_id === null
+        ? null
+        : dc.dashboard_tab_id < 0 ? tabOf.get(dc.dashboard_tab_id) ?? null : dc.dashboard_tab_id;
+      const match = candidates.find((s) =>
+        !taken.has(s.id) &&
+        (s.dashboard_tab_id ?? null) === tab &&
+        s.row === dc.row && s.col === dc.col && s.size_x === dc.size_x && s.size_y === dc.size_y &&
+        (s.card_id ?? null) === (dc.card_id ?? null));
+      if (match) taken.add(match.id);
+      return { temp_id: dc.id, id: match ? match.id : null, card_id: dc.card_id ?? null, tab };
+    });
+}
+
 export class MetabaseClient {
   private axiosInstance: AxiosInstance;
   private sessionToken: string | null = null;
@@ -224,6 +261,12 @@ export class MetabaseClient {
             user,
           });
           if (message && error instanceof Error) error.message = message;
+        } else if (status && status >= 400 && error instanceof Error) {
+          // Any other failure: keep axios' status line, add the request and
+          // what Metabase said, so a bare «status code 400» explains itself.
+          const detail = metabaseDetail((error as any)?.response?.data);
+          const where = `${((error as any)?.config?.method || 'GET').toUpperCase()} ${(error as any)?.config?.url || '?'}`;
+          error.message = `${error.message} (${where})${detail ? `. Metabase said: "${detail}"` : ''}`;
         }
         return Promise.reject(error);
       }
@@ -755,8 +798,10 @@ export class MetabaseClient {
       return result;
     }
     const after: any = await this.getDashboard(dashboardId);
-    result.tabs = orderedTabs(after.tabs).map((t: any) => ({ id: t.id, name: t.name, position: t.position }));
+    const afterTabs = orderedTabs(after.tabs);
+    result.tabs = afterTabs.map((t: any) => ({ id: t.id, name: t.name, position: t.position }));
     result.dashcards = (after.dashcards || []).length;
+    result.created = createdDashcardIds(nextTabs, afterTabs, dashcards, after.dashcards || []);
     return result;
   }
 
@@ -915,37 +960,60 @@ export class MetabaseClient {
           const filter = filters.get(m.parameter_id);
           return { id: m.parameter_id, type: filter.type, target: m.target, value: filterValue(filter.type, values[m.parameter_id]) };
         });
-      const base = {
+      const base: any = {
         tab: dc.dashboard_tab_id !== undefined && dc.dashboard_tab_id !== null ? tabName.get(dc.dashboard_tab_id) ?? dc.dashboard_tab_id : null,
         dashcard_id: dc.id,
         card_id: dc.card_id,
         name: dc.card?.name ?? null,
+        display: dc.card?.display ?? null,
         hide_empty: Boolean(dc.visualization_settings?.['card.hide_empty']),
       };
       try {
-        const res = await this.axiosInstance.post(
-          `/api/dashboard/${dashboardId}/dashcard/${dc.id}/card/${dc.card_id}/query`,
-          { parameters },
-        );
+        // Run the card's own query ad hoc (POST /api/dataset) with the values
+        // the dashboard would send. The dashcard endpoint would also store them
+        // as the user's «last used» filter values, so a check with a future
+        // month left the real dashboard empty for that user.
+        const card = dc.card?.dataset_query ? dc.card : await this.getCard(dc.card_id);
+        const res = await this.axiosInstance.post('/api/dataset', { ...card.dataset_query, parameters });
         const data = res.data || {};
         if (data.status === 'failed' || data.error) {
           return { ...base, status: 'error', rows: 0, error: truncate(errorText(data.error ?? data)) };
         }
         const rows = Array.isArray(data.data?.rows) ? data.data.rows.length : (data.row_count ?? 0);
-        return { ...base, status: rows === 0 ? 'empty' : 'ok', rows };
+        const viz = validateVisualization(
+          card.display ?? dc.card?.display,
+          effectiveSettings(card.visualization_settings ?? dc.card?.visualization_settings, dc.visualization_settings),
+          columnsOf(data),
+        );
+        const out: any = { ...base, rows };
+        if (viz.errors.length) {
+          out.status = 'chart_error';
+          out.chart_errors = viz.errors;
+        } else {
+          out.status = rows === 0 ? 'empty' : 'ok';
+        }
+        if (viz.warnings.length) out.chart_warnings = viz.warnings;
+        return out;
       } catch (err) {
         return { ...base, status: 'error', rows: 0, error: truncate(errorText(err)) };
       }
     };
 
     const results = await mapLimited(toRun, Math.max(1, Math.min(opts.concurrency ?? 3, 3)), runOne);
-    const totals = { ok: 0, empty: 0, errors: 0 };
+    const totals = { ok: 0, empty: 0, chart_errors: 0, errors: 0 };
     for (const r of results) {
       if (r.status === 'ok') totals.ok++;
       else if (r.status === 'empty') totals.empty++;
+      else if (r.status === 'chart_error') totals.chart_errors++;
       else totals.errors++;
     }
-    return { dashboard_id: dashboardId, values, totals, cards: results };
+    return {
+      dashboard_id: dashboardId,
+      values,
+      totals,
+      checks: 'Each query runs and its result fits the chart settings. The rendered chart itself is not inspected: use preview_card to see it. Nothing is saved as the user\'s filter values.',
+      cards: results,
+    };
   }
 
   /**
@@ -1019,14 +1087,28 @@ export class MetabaseClient {
     return this.putDashboardSafe(dashboardId, { dashcards: cards });
   }
 
-  async updateDashcard(dashboardId: number, dashcardId: number, updates: any): Promise<any> {
+  async updateDashcard(
+    dashboardId: number,
+    dashcardId: number,
+    updates: any,
+    opts: { replaceVisualizationSettings?: boolean } = {},
+  ): Promise<any> {
     const dashboard: any = await this.getDashboard(dashboardId);
     const dashcards: any[] = dashboard.dashcards || [];
     if (!dashcards.some((dc) => dc.id === dashcardId)) {
       throw new Error(`Dashcard with id ${dashcardId} not found in dashboard ${dashboardId}`);
     }
     // The id cannot be changed through updates: that would delete the dashcard.
-    const updated = dashcards.map((dc) => (dc.id === dashcardId ? { ...dc, ...updates, id: dashcardId } : dc));
+    // visualization_settings merge into the current ones unless asked to replace:
+    // sending {text} to change a heading must not wipe virtual_card or the rest.
+    const updated = dashcards.map((dc) => {
+      if (dc.id !== dashcardId) return dc;
+      const next = { ...dc, ...updates, id: dashcardId };
+      if (updates?.visualization_settings && !opts.replaceVisualizationSettings) {
+        next.visualization_settings = effectiveSettings(dc.visualization_settings, updates.visualization_settings);
+      }
+      return next;
+    });
     return this.putDashboardSafe(dashboardId, { dashcards: updated });
   }
 
@@ -1156,6 +1238,25 @@ export class MetabaseClient {
     } else {
       await this.axiosInstance.put(`/api/card/${id}`, { archived: true });
     }
+  }
+
+  /**
+   * The card rendered as a PNG by Metabase's static renderer, the one it uses
+   * for dashboard subscriptions (GET /api/pulse/preview_card_png/:id). It runs
+   * the saved question with its defaults, so dashboard filters and dashcard
+   * overrides do not apply. A chart that cannot be drawn fails here too.
+   */
+  async previewCardPng(id: number): Promise<{ base64: string; bytes: number }> {
+    const response = await this.axiosInstance.get(`/api/pulse/preview_card_png/${id}`, {
+      responseType: 'arraybuffer',
+    });
+    const buf = Buffer.from(response.data);
+    const type = String(response.headers?.['content-type'] || '');
+    if (!type.includes('image/png')) {
+      const text = buf.toString('utf8').slice(0, 300);
+      throw new Error(`Metabase did not return an image for card ${id} (${type || 'no content type'}): ${text}`);
+    }
+    return { base64: buf.toString('base64'), bytes: buf.length };
   }
 
   async executeCard(id: number, options: { ignore_cache?: boolean; collection_preview?: boolean; dashboard_id?: number } = {}): Promise<QueryResult> {
