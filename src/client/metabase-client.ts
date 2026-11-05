@@ -218,7 +218,7 @@ export class MetabaseClient {
   }
 
   async getDashboardRevisions(id: number): Promise<any> {
-    const response = await this.axiosInstance.get(`/api/dashboard/${id}/revisions`);
+    const response = await this.axiosInstance.get(`/api/revision/dashboard/${id}`);
     return response.data;
   }
 
@@ -246,120 +246,171 @@ export class MetabaseClient {
     return response.data;
   }
 
-  async addCardToDashboard(dashboardId: number, cardData: any): Promise<any> {
-    // Get current dashboard to preserve existing state
-    const dashboard = await this.getDashboard(dashboardId);
-    const existingDashcards = (dashboard as any).dashcards || [];
-    const existingTabs = (dashboard as any).tabs || [];
-    
-    // Calculate default position for new card
-    const cardWidth = 12;
-    const cardHeight = 8;
+  // ── Safe dashboard writes ────────────────────────────────────────────────
+  // PUT /api/dashboard/:id diffs what it receives against what is stored: a
+  // dashcard missing from `dashcards` is DELETED, one with a negative id is
+  // created, and tabs work the same way. Sending `dashcards` without `tabs`
+  // deletes every tab. So every write that touches the layout goes through
+  // putDashboardSafe, which keeps the stored tabs unless new ones are given.
 
-    // Build the new dashcard - use id: -1 for new cards per Metabase convention
+  static readonly DASHCARD_FIELDS = [
+    'id', 'card_id', 'dashboard_tab_id', 'row', 'col', 'size_x', 'size_y', 'series',
+    'action_id', 'inline_parameters', 'parameter_mappings', 'visualization_settings',
+  ] as const;
+
+  /** Only the fields PUT /api/dashboard/:id accepts for a dashcard (no nested `card`, no read-only fields). */
+  normalizeDashcard(dc: any): any {
+    const out: any = {};
+    for (const field of MetabaseClient.DASHCARD_FIELDS) {
+      if (dc[field] !== undefined) out[field] = dc[field];
+    }
+    if (out.card_id === undefined) out.card_id = null; // text and heading cards
+    out.series = out.series || [];
+    out.parameter_mappings = out.parameter_mappings || [];
+    out.visualization_settings = out.visualization_settings || {};
+    return out;
+  }
+
+  private normalizeTab(tab: any): any {
+    return { id: tab.id, name: tab.name };
+  }
+
+  /** The newest revision id of a dashboard, or null when it cannot be read. */
+  private async latestRevisionId(dashboardId: number): Promise<number | null> {
+    try {
+      const revisions = await this.getDashboardRevisions(dashboardId);
+      const list = Array.isArray(revisions) ? revisions : revisions?.data;
+      if (!Array.isArray(list) || list.length === 0) return null;
+      return list.reduce((max: number, r: any) => (typeof r.id === 'number' && r.id > max ? r.id : max), -Infinity);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Writes a dashboard without losing tabs or dashcards by accident.
+   *
+   * 1. Reads the dashboard.
+   * 2. When the body brings `dashcards` but no `tabs`, sends the stored tabs.
+   * 3. When there are tabs, refuses dashcards without a `dashboard_tab_id`, or
+   *    pointing at a tab that is not in the list.
+   * 4. Records the revision before the write, so it can be undone with
+   *    revert_dashboard, and returns it with a summary of what changed.
+   */
+  async putDashboardSafe(dashboardId: number, body: { dashcards?: any[]; tabs?: any[]; [key: string]: any }): Promise<{
+    dashboard: any;
+    previous_revision_id: number | null;
+    diff: {
+      dashcards: { added: number; kept: number; removed: number[] };
+      tabs: { added: number; kept: number; removed: number[] };
+    };
+  }> {
+    const current: any = await this.getDashboard(dashboardId);
+    const currentDashcards: any[] = current.dashcards || [];
+    const currentTabs: any[] = current.tabs || [];
+
+    const { dashcards, tabs, ...rest } = body;
+    const payload: any = { ...rest };
+
+    const nextTabs = (tabs ?? currentTabs).map((t: any) => this.normalizeTab(t));
+    if (tabs !== undefined || dashcards !== undefined) payload.tabs = nextTabs;
+
+    let nextDashcards: any[] | undefined;
+    if (dashcards !== undefined) {
+      nextDashcards = dashcards.map((dc: any) => this.normalizeDashcard(dc));
+      if (nextTabs.length > 0) {
+        const tabIds = new Set(nextTabs.map((t: any) => t.id));
+        const tabList = nextTabs.map((t: any) => `${t.id} (${t.name})`).join(', ');
+        for (const dc of nextDashcards) {
+          if (dc.dashboard_tab_id === undefined || dc.dashboard_tab_id === null) {
+            throw new Error(
+              `Dashboard ${dashboardId} has tabs, so every dashcard needs dashboard_tab_id (dashcard ${dc.id} has none). Tabs: ${tabList}`
+            );
+          }
+          if (!tabIds.has(dc.dashboard_tab_id)) {
+            throw new Error(
+              `Dashcard ${dc.id} points at tab ${dc.dashboard_tab_id}, which is not in the dashboard. Tabs: ${tabList}`
+            );
+          }
+        }
+      }
+      payload.dashcards = nextDashcards;
+    }
+
+    const previous_revision_id = await this.latestRevisionId(dashboardId);
+    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, payload);
+
+    const diffOf = (before: any[], after: any[] | undefined) => {
+      if (after === undefined) return { added: 0, kept: before.length, removed: [] as number[] };
+      const afterIds = new Set(after.filter((x) => x.id > 0).map((x) => x.id));
+      return {
+        added: after.filter((x) => !(x.id > 0)).length,
+        kept: before.filter((x) => afterIds.has(x.id)).length,
+        removed: before.filter((x) => !afterIds.has(x.id)).map((x) => x.id),
+      };
+    };
+
+    return {
+      dashboard: response.data,
+      previous_revision_id,
+      diff: {
+        dashcards: diffOf(currentDashcards, nextDashcards),
+        tabs: diffOf(currentTabs, payload.tabs),
+      },
+    };
+  }
+
+  async addCardToDashboard(dashboardId: number, cardData: any): Promise<any> {
+    const dashboard: any = await this.getDashboard(dashboardId);
+    const existing: any[] = dashboard.dashcards || [];
+
+    // id -1: a new dashcard, per Metabase's convention.
     const newDashcard: any = {
       id: -1,
       row: cardData.row !== undefined ? cardData.row : 0,
       col: cardData.col !== undefined ? cardData.col : 0,
-      size_x: cardData.size_x || cardData.sizeX || cardWidth,
-      size_y: cardData.size_y || cardData.sizeY || cardHeight,
+      size_x: cardData.size_x || cardData.sizeX || 12,
+      size_y: cardData.size_y || cardData.sizeY || 8,
       series: cardData.series || [],
       visualization_settings: cardData.visualization_settings || {},
-      parameter_mappings: cardData.parameter_mappings || []
+      parameter_mappings: cardData.parameter_mappings || [],
     };
-    
-    // Handle card_id - can be null for text/virtual cards
+    // card_id stays null for text and heading cards.
     const cardId = cardData.cardId ?? cardData.card_id;
-    if (cardId !== undefined) {
-      newDashcard.card_id = cardId;
-    }
-    
-    // Add dashboard_tab_id if provided (for dashboards with tabs)
-    if (cardData.dashboard_tab_id !== undefined) {
-      newDashcard.dashboard_tab_id = cardData.dashboard_tab_id;
-    }
-    
-    // Clean existing dashcards - remove nested 'card' object and other read-only fields
-    const cleanedExistingDashcards = existingDashcards.map((dc: any) => ({
-      id: dc.id,
-      card_id: dc.card_id,
-      row: dc.row,
-      col: dc.col,
-      size_x: dc.size_x,
-      size_y: dc.size_y,
-      series: dc.series || [],
-      visualization_settings: dc.visualization_settings || {},
-      parameter_mappings: dc.parameter_mappings || [],
-      ...(dc.dashboard_tab_id !== undefined && { dashboard_tab_id: dc.dashboard_tab_id })
-    }));
-    
-    // Combine existing dashcards with new dashcard
-    const updatedDashcards = [...cleanedExistingDashcards, newDashcard];
-    
-    // Use PUT /api/dashboard/:id with dashcards and tabs arrays
-    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, {
-      dashcards: updatedDashcards,
-      tabs: existingTabs
-    });
-    return response.data;
+    if (cardId !== undefined) newDashcard.card_id = cardId;
+    if (cardData.dashboard_tab_id !== undefined) newDashcard.dashboard_tab_id = cardData.dashboard_tab_id;
+    if (cardData.inline_parameters !== undefined) newDashcard.inline_parameters = cardData.inline_parameters;
+    if (cardData.action_id !== undefined) newDashcard.action_id = cardData.action_id;
+
+    return this.putDashboardSafe(dashboardId, { dashcards: [...existing, newDashcard] });
   }
 
+  /** Replaces ALL dashcards: any existing dashcard missing from `cards` is deleted. */
   async updateDashboardCards(dashboardId: number, cards: any[]): Promise<any> {
-    // Get current dashboard to preserve existing properties
-    const dashboard = await this.getDashboard(dashboardId);
-    
-    // Replace all dashcards with the provided cards while preserving other properties
-    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, {
-      ...dashboard,
-      dashcards: cards
-    });
-    return response.data;
+    return this.putDashboardSafe(dashboardId, { dashcards: cards });
   }
 
   async updateDashcard(dashboardId: number, dashcardId: number, updates: any): Promise<any> {
-    // Get current dashboard to preserve existing properties
-    const dashboard = await this.getDashboard(dashboardId);
-    const dashcards = (dashboard as any).dashcards || [];
-    
-    // Find and update only the specific dashcard
-    const updatedDashcards = dashcards.map((dc: any) => {
-      if (dc.id === dashcardId) {
-        // Merge updates into the existing dashcard
-        return { ...dc, ...updates };
-      }
-      return dc;
-    });
-    
-    // Verify the dashcard was found
-    const dashcardExists = dashcards.some((dc: any) => dc.id === dashcardId);
-    if (!dashcardExists) {
+    const dashboard: any = await this.getDashboard(dashboardId);
+    const dashcards: any[] = dashboard.dashcards || [];
+    if (!dashcards.some((dc) => dc.id === dashcardId)) {
       throw new Error(`Dashcard with id ${dashcardId} not found in dashboard ${dashboardId}`);
     }
-    
-    // Update dashboard with modified dashcards
-    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, {
-      ...dashboard,
-      dashcards: updatedDashcards
-    });
-    return response.data;
+    // The id cannot be changed through updates: that would delete the dashcard.
+    const updated = dashcards.map((dc) => (dc.id === dashcardId ? { ...dc, ...updates, id: dashcardId } : dc));
+    return this.putDashboardSafe(dashboardId, { dashcards: updated });
   }
 
   async removeCardsFromDashboard(dashboardId: number, dashcardIds: number[]): Promise<any> {
-    // Get current dashboard to preserve existing properties
-    const dashboard = await this.getDashboard(dashboardId);
-    const existingDashcards = (dashboard as any).dashcards || [];
-    
-    // Filter out the dashcards to be removed by their dashcard id (not card_id)
-    const filteredDashcards = existingDashcards.filter((dashcard: any) => 
-      !dashcardIds.includes(dashcard.id)
-    );
-    
-    // Update dashboard with filtered dashcards while preserving other properties
-    const response = await this.axiosInstance.put(`/api/dashboard/${dashboardId}`, {
-      ...dashboard,
-      dashcards: filteredDashcards
+    const dashboard: any = await this.getDashboard(dashboardId);
+    const dashcards: any[] = dashboard.dashcards || [];
+    const missing = dashcardIds.filter((id) => !dashcards.some((dc) => dc.id === id));
+    if (missing.length) {
+      throw new Error(`Dashcards ${missing.join(', ')} not found in dashboard ${dashboardId}`);
+    }
+    return this.putDashboardSafe(dashboardId, {
+      dashcards: dashcards.filter((dc) => !dashcardIds.includes(dc.id)),
     });
-    return response.data;
   }
 
   async favoriteDashboard(id: number): Promise<any> {
@@ -373,8 +424,10 @@ export class MetabaseClient {
   }
 
   async revertDashboard(id: number, revisionId: number): Promise<any> {
-    const response = await this.axiosInstance.post(`/api/dashboard/${id}/revert`, {
-      revision_id: revisionId
+    const response = await this.axiosInstance.post('/api/revision/revert', {
+      entity: 'dashboard',
+      id,
+      revision_id: revisionId,
     });
     return response.data;
   }
