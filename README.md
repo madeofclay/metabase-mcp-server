@@ -72,8 +72,12 @@ The server supports command-line arguments to customize tool loading:
 
 - **`--essential`** (default): Load only essential tools
 - **`--all`**: Load all 80+ available tools
-- **`--write`**: Load only write/modification tools
-- **`--read`**: Load only read-only tools
+- **`--write`**: Load read and write tools
+- **`--read`**: Load only read-only tools (nothing that modifies Metabase)
+
+Without a flag, the mode can also come from the `METABASE_MCP_TOOLS` environment
+variable (`essential`, `all`, `read` or `write`); a flag always wins over it. This is
+handy where the command line is hard to change, e.g. a supervisord program.
 
 ```bash
 # Using published package (recommended)
@@ -83,7 +87,7 @@ npx @cognitionai/metabase-mcp-server
 # Load all tools
 npx @cognitionai/metabase-mcp-server --all
 
-# Load only write tools
+# Load read and write tools
 npx @cognitionai/metabase-mcp-server --write
 
 # Load only read-only tools
@@ -93,9 +97,14 @@ npx @cognitionai/metabase-mcp-server --read
 npm run build
 node dist/server.js                    # Default (essential tools)
 node dist/server.js --all             # All tools
-node dist/server.js --write           # Write tools only
+node dist/server.js --write           # Read and write tools
 node dist/server.js --read            # Read-only tools only
+METABASE_MCP_TOOLS=all node dist/server.js   # Same as --all
 ```
+
+For MongoDB databases, `execute_query` and `create_card` take the aggregation
+pipeline as a JSON string in `query` plus the `collection` it runs on, which
+Metabase requires.
 
 ## 🌐 HTTP Stream Transport (Shared Deployment)
 

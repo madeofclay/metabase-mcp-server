@@ -14,9 +14,14 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    por request (modo HTTP Stream, vía headers `x-metabase-*`).
 2. Registra las herramientas MCP (`addDashboardTools`, `addDatabaseTools`,
    `addCardTools`, `addTableTools`, `addAdditionalTools`) sobre `FastMCP`, filtradas
-   según el modo (`--essential` por defecto, `--all`, `--read`, `--write`).
+   según el modo (`--essential` por defecto, `--all`, `--read`, `--write`). Sin flag,
+   el modo sale de `METABASE_MCP_TOOLS` (`essential|all|read|write`); el flag gana.
+   En gracia-dev basta con poner esa variable en el `environment` del programa de
+   supervisord del HTTP Stream (`dist/server.js`, puerto 8011) y reiniciarlo.
 3. Cada tool invoca `MetabaseClient` (`src/client/metabase-client.ts`), que llama a la
-   REST API de Metabase (axios) usando la sesión/API key resuelta.
+   REST API de Metabase (axios) usando la sesión/API key resuelta. En bases MongoDB,
+   `execute_query` y `create_card` reciben el pipeline como JSON en `query` y la
+   `collection` aparte: Metabase rechaza una query nativa de Mongo sin ella.
 4. En modo HTTP Stream, el servidor escucha en `/mcp` (puerto 8011 por defecto).
 5. Opcionalmente, `src/oauth-gateway.ts` corre un servidor Express separado (puerto
    8080 por defecto) que implementa Authorization Code + PKCE: muestra un formulario
@@ -38,7 +43,7 @@ src/
     database-tools.ts     # gestión de conexiones de bases de datos en Metabase, schema sync
     table-tools.ts        # metadata de tablas/campos, operaciones de datos (incl. replace CSV)
     additional-tools.ts   # colecciones, búsqueda, usuarios, actividad, playground links
-    tool-filters.ts        # parseo de flags --essential/--all/--read/--write
+    tool-filters.ts        # modo de tools: flags --essential/--all/--read/--write o METABASE_MCP_TOOLS
   utils/config.ts         # carga y valida METABASE_URL / credenciales desde env vars
   types/                  # tipos de config y errores
 docs/spec-google-sso-auth.md  # spec (no implementada del todo) para soportar sesión de Google SSO
