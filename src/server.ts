@@ -8,12 +8,14 @@ import { addDatabaseTools } from "./tools/database-tools.js";
 import { addCardTools } from "./tools/card-tools.js";
 import { addTableTools } from "./tools/table-tools.js";
 import { addAdditionalTools } from "./tools/additional-tools.js";
-import { parseToolFilterOptions, toolAllowed } from "./utils/tool-filters.js";
+import { parseToolFilterOptions, toolAllowed, setDestructiveAllowed } from "./utils/tool-filters.js";
+import { toolAnnotations } from "./utils/tool-annotations.js";
 import { createAuthenticateHandler, createClientResolver } from "./auth.js";
 import { hydrateEnvFromVault } from "./utils/secrets.js";
 
 // Parse command line arguments for tool filtering
 const filterOptions = parseToolFilterOptions();
+setDestructiveAllowed(filterOptions.allowDestructive);
 
 const isHttpMode = process.env.MCP_TRANSPORT === 'http';
 
@@ -51,12 +53,17 @@ if (isHttpMode) {
 // Create FastMCP server
 const server = new FastMCP(serverOptions);
 
-// Override addTool to apply tool filtering (unchanged behavior)
+// Override addTool to apply tool filtering and attach the MCP annotations that
+// clients use to group tools (read-only vs. write vs. destructive).
 const originalAddTool = server.addTool.bind(server);
 server.addTool = function(toolConfig: any) {
   const { metadata = {}, ...restConfig } = toolConfig;
-  if (!toolAllowed(filterOptions.mode, metadata)) return;
-  originalAddTool(restConfig);
+  if (!toolAllowed(filterOptions, restConfig.name, metadata)) return;
+  const annotations = toolAnnotations(restConfig.name, filterOptions.allowDestructive);
+  if (!annotations) {
+    console.error(`WARN: tool ${restConfig.name} has no group in src/utils/tool-annotations.ts`);
+  }
+  originalAddTool(annotations ? { ...restConfig, annotations: { ...annotations, ...restConfig.annotations } } : restConfig);
 };
 
 // Adding all tools — each execute calls getClient(context) internally
@@ -67,7 +74,7 @@ addTableTools(server, getClient);
 addAdditionalTools(server, getClient);
 
 // Log filtering status
-console.error(`INFO: Tool filtering mode: ${filterOptions.mode} ${filterOptions.mode === 'essential' ? '(default)' : ''}`);
+console.error(`INFO: Tool filtering mode: ${filterOptions.mode} ${filterOptions.mode === 'essential' ? '(default)' : ''} · destructive tools: ${filterOptions.allowDestructive ? 'allowed' : 'off'}`);
 
 switch (filterOptions.mode) {
   case 'essential':
@@ -77,7 +84,7 @@ switch (filterOptions.mode) {
     console.error(`INFO: Read-only tools loaded.`);
     break;
   case 'write':
-    console.error(`INFO: Read and write tools loaded.`);
+    console.error(`INFO: Read and write tools loaded (no destructive tools unless --allow-destructive).`);
     break;
   case 'all':
     console.error(`INFO: All tools loaded.`);

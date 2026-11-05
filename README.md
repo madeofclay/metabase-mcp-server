@@ -71,12 +71,22 @@ export METABASE_PASSWORD=your_password
 The server supports command-line arguments to customize tool loading:
 
 - **`--essential`** (default): Load only essential tools
-- **`--all`**: Load all 80+ available tools
-- **`--write`**: Load read and write tools
 - **`--read`**: Load only read-only tools (nothing that modifies Metabase)
+- **`--write`**: Load read and write tools, **without destructive ones**
+- **`--all`**: Load every tool, destructive ones included
+- **`--allow-destructive`**: Also load destructive tools (deletes, replacements,
+  database connection changes, reverts) in the chosen mode
 
-Without a flag, the mode can also come from the `METABASE_MCP_TOOLS` environment
-variable (`essential`, `all`, `read` or `write`); a flag always wins over it. This is
+Every tool belongs to one group, read, write or destructive
+(`src/utils/tool-annotations.ts`), and declares it with MCP annotations
+(`readOnlyHint`, `destructiveHint`) so clients such as Claude.ai can group them and
+let you allow, confirm or block each group. Without `--allow-destructive`,
+`put_dashboard_layout` and `manage_dashboard_tabs` still build and edit dashboards
+but refuse to delete cards or tabs.
+
+Without a flag, the settings can also come from environment variables:
+`METABASE_MCP_TOOLS` (`essential`, `read`, `write` or `all`) and
+`METABASE_MCP_ALLOW_DESTRUCTIVE` (`true` or `false`); a flag always wins. This is
 handy where the command line is hard to change, e.g. a supervisord program.
 
 ```bash
@@ -100,6 +110,8 @@ node dist/server.js --all             # All tools
 node dist/server.js --write           # Read and write tools
 node dist/server.js --read            # Read-only tools only
 METABASE_MCP_TOOLS=all node dist/server.js   # Same as --all
+METABASE_MCP_TOOLS=write node dist/server.js # Read and write, no destructive tools
+node dist/server.js --write --allow-destructive  # Read, write and destructive
 ```
 
 For MongoDB databases, `execute_query` and `create_card` take the aggregation
