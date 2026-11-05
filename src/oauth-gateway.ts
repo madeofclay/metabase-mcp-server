@@ -27,7 +27,7 @@
  *   JWT_SECRET             Secret for signing tokens        (required — env var or vault)
  *   TOKEN_EXPIRY           Access token expiry              (default: 1h)
  *   REFRESH_TOKEN_EXPIRY   Refresh token expiry; a connection unused this long
- *                          must sign in again               (default: 7d)
+ *                          must sign in again               (default: 14d)
  *   GRANT_MAX_AGE          Absolute life of a connection, however often it is
  *                          refreshed                        (default: 30d)
  *   GRANT_STORE_PATH       Grant store file, or :memory:    (default: ./data/grants.json)
@@ -96,7 +96,7 @@ function durationS(value: string, name: string): number {
 // Short access tokens, a refresh token that dies when the connection sits idle,
 // and an absolute end to every connection (RFC 9700 §2.2.2, §4.14.2).
 const TOKEN_EXPIRY_S         = durationS(process.env.TOKEN_EXPIRY || '1h', 'TOKEN_EXPIRY');
-const REFRESH_TOKEN_EXPIRY_S = durationS(process.env.REFRESH_TOKEN_EXPIRY || '7d', 'REFRESH_TOKEN_EXPIRY');
+const REFRESH_TOKEN_EXPIRY_S = durationS(process.env.REFRESH_TOKEN_EXPIRY || '14d', 'REFRESH_TOKEN_EXPIRY');
 const GRANT_MAX_AGE_S        = durationS(process.env.GRANT_MAX_AGE || '30d', 'GRANT_MAX_AGE');
 
 // How long a replaced refresh token is still honoured, for a client that lost

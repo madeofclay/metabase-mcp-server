@@ -719,7 +719,7 @@ describe('grants', () => {
   it('uses a short access token and a refresh token that dies when idle', async () => {
     const body = await pair();
     expect(body.expires_in).toBe(3600);
-    expect(body.refresh_expires_in).toBe(7 * 86400);
+    expect(body.refresh_expires_in).toBe(14 * 86400);
   });
 
   it('honours a replaced refresh token briefly, for a client retrying a lost response', async () => {

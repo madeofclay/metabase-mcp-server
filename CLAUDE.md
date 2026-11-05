@@ -27,7 +27,7 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    derivada de `JWT_SECRET`, ligadas al id del grant, `src/credentials.ts`) y los
    JWT sólo llevan el id del grant, firmados HS256 con emisor fijo. Así un token
    filtrado no revela nada y revocar corta todos los tokens del grant al instante,
-   porque `/mcp` revisa el grant en cada llamada. Plazos: acceso 1 h, refresh 7 días
+   porque `/mcp` revisa el grant en cada llamada. Plazos: acceso 1 h, refresh 14 días
    sin uso, grant 30 días absolutos. El refresh rota en cada uso y el almacén sólo
    guarda un HMAC de su `jti`: si vuelve un refresh ya reemplazado (pasados 30 s de
    gracia para reintentos), se revoca el grant entero. `POST /oauth/revoke`
