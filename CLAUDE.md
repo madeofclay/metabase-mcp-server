@@ -14,9 +14,14 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    por request (modo HTTP Stream, vía headers `x-metabase-*`).
 2. Registra las herramientas MCP (`addDashboardTools`, `addDatabaseTools`,
    `addCardTools`, `addTableTools`, `addAdditionalTools`) sobre `FastMCP`, filtradas
-   según el modo (`--essential` por defecto, `--all`, `--read`, `--write`).
+   según el modo (`--essential` por defecto, `--all`, `--read`, `--write`). Sin flag,
+   el modo sale de `METABASE_MCP_TOOLS` (`essential|all|read|write`); el flag gana.
+   En gracia-dev basta con poner esa variable en el `environment` del programa de
+   supervisord del HTTP Stream (`dist/server.js`, puerto 8011) y reiniciarlo.
 3. Cada tool invoca `MetabaseClient` (`src/client/metabase-client.ts`), que llama a la
-   REST API de Metabase (axios) usando la sesión/API key resuelta.
+   REST API de Metabase (axios) usando la sesión/API key resuelta. En bases MongoDB,
+   `execute_query` y `create_card` reciben el pipeline como JSON en `query` y la
+   `collection` aparte: Metabase rechaza una query nativa de Mongo sin ella.
 4. En modo HTTP Stream, el servidor escucha en `/mcp` (puerto 8011 por defecto).
 5. Opcionalmente, `src/oauth-gateway.ts` corre un servidor Express separado (puerto
    8080 por defecto) que implementa Authorization Code + PKCE (obligatorio, S256):
@@ -49,6 +54,43 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    refresh con `invalid_grant` y revoca el grant, para que Claude pida reconectar en
    vez de fallar en cada tool. Sin esas dos variables queda el login de Google en el navegador, sin
    renovación.
+7. Para armar dashboards completos (pestañas, layout, filtros conectados a variables
+   SQL y verificación) están `put_dashboard_layout`, `manage_dashboard_tabs`,
+   `set_dashboard_filters`, `run_dashcards` y `test_native_query`. Toda escritura del
+   layout pasa por `MetabaseClient.putDashboardSafe`, que conserva las pestañas, manda
+   sólo los campos que acepta el PUT, valida antes de escribir y devuelve
+   `previous_revision_id` para `revert_dashboard`.
+
+## Gotchas de Metabase 0.63
+
+Verificados contra analytics.clay.cl (dashboard 621 y su copia de prueba 622):
+
+- `PUT /api/dashboard/:id` aplica un diff: un dashcard que no viene en `dashcards` se
+  **borra**, uno con id negativo se crea. Las pestañas funcionan igual, y mandar
+  `dashcards` sin `tabs` **borra todas las pestañas**. Si hay pestañas, todo dashcard
+  necesita `dashboard_tab_id`.
+- En un mismo PUT se pueden crear pestañas con id negativo y apuntar dashcards a ellas
+  (`dashboard_tab_id: -1`), incluidos textos con `card_id: null` e ids de dashcard
+  negativos: Metabase asigna los ids reales y deja cada tarjeta en su pestaña.
+- El PUT acepta en cada dashcard sólo `id, card_id, dashboard_tab_id, row, col, size_x,
+  size_y, series, action_id, inline_parameters, parameter_mappings,
+  visualization_settings`: el `card` anidado del GET hay que quitarlo. Grilla de 24
+  columnas.
+- Mapping de un filtro a una variable SQL: `target: ["variable", ["template-tag", "x"]]`
+  **sin** tercer elemento; con `{"stage-number": 0}` responde «invalid tuple size».
+- `GET /api/card/:id` devuelve MBQL 5: `dataset_query.stages[0].native` y
+  `stages[0]["template-tags"]` como **lista**. Para cambiar el SQL se hace PUT de ese
+  mismo `dataset_query` editado. El formato legacy usa `native.query` y
+  `template-tags` como objeto.
+- Una query nativa de MongoDB necesita `native.collection`; sin ella falla.
+- Un filtro `date/month-year` con valor `2026-09` llega a una variable `date` como
+  `'2026-09-01'`. `string/=` (lista fija: `values_source_type: "static-list"`,
+  `values_source_config: {values: [...]}`) funciona con una variable `text`; su valor
+  va como lista.
+- Correr una tarjeta como la corre el dashboard:
+  `POST /api/dashboard/:did/dashcard/:dcid/card/:cid/query` con `{parameters}`.
+- Revisiones: `GET /api/revision/dashboard/:id`; revertir:
+  `POST /api/revision/revert {entity: "dashboard", id, revision_id}`.
 
 ## Estructura de carpetas
 
@@ -68,14 +110,18 @@ src/
     database-tools.ts     # gestión de conexiones de bases de datos en Metabase, schema sync
     table-tools.ts        # metadata de tablas/campos, operaciones de datos (incl. replace CSV)
     additional-tools.ts   # colecciones, búsqueda, usuarios, actividad, playground links
-    tool-filters.ts        # parseo de flags --essential/--all/--read/--write
-  utils/config.ts         # carga y valida METABASE_URL / credenciales desde env vars
+  utils/
+    config.ts             # carga y valida METABASE_URL / credenciales desde env vars
+    tool-filters.ts       # modo de tools: flags --essential/--all/--read/--write o METABASE_MCP_TOOLS
+    template-tags.ts      # {{variables}} del SQL nativo -> template tags (MBQL 5 y legacy)
   types/                  # tipos de config y errores
 docs/spec-google-sso-auth.md  # spec (no implementada del todo) para soportar sesión de Google SSO
 Dockerfile / docker-compose.yml / docker-run.sh  # empaquetado para self-host vía Docker
 smithery.yaml             # manifiesto para publicar en el registro Smithery (MCP)
 .github/workflows/publish.yml  # única CI/CD: publica el paquete a npm en push a main
-tests/                    # vitest (auth, config, metabase-client, oauth-gateway, google-sso, grant-store, tool-filters)
+tests/                    # vitest (auth, config, metabase-client, oauth-gateway, google-sso,
+                          #   grant-store, tool-filters, mongo-native-query, dashboard-safe-put,
+                          #   dashboard-tabs, dashboard-layout, template-tags-filters, verification)
 ```
 
 ## Dependencias de infraestructura
@@ -142,6 +188,9 @@ de los dos programas. El gateway necesita `GRANT_STORE_PATH` en un directorio
 escribible por su usuario (el archivo lleva credenciales cifradas: no copiarlo ni
 respaldarlo junto con `JWT_SECRET`). Rotar `METABASE_MCP_GATEWAY_SECRET` invalida
 todos los grants y obliga a reconectar. No hay despliegue en gracia-prod.
+
+El programa del HTTP Stream (`dist/server.js`, puerto 8011) puede cargar todas las
+tools con `METABASE_MCP_TOOLS=all` en su `environment`; por defecto carga las `essential`.
 
 **Gotcha detectado (no corregido en este levantamiento):** el `CMD` del `Dockerfile`
 ejecuta `node dist/index.js`, pero el build y `package.json.main` generan

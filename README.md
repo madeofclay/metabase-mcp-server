@@ -72,8 +72,12 @@ The server supports command-line arguments to customize tool loading:
 
 - **`--essential`** (default): Load only essential tools
 - **`--all`**: Load all 80+ available tools
-- **`--write`**: Load only write/modification tools
-- **`--read`**: Load only read-only tools
+- **`--write`**: Load read and write tools
+- **`--read`**: Load only read-only tools (nothing that modifies Metabase)
+
+Without a flag, the mode can also come from the `METABASE_MCP_TOOLS` environment
+variable (`essential`, `all`, `read` or `write`); a flag always wins over it. This is
+handy where the command line is hard to change, e.g. a supervisord program.
 
 ```bash
 # Using published package (recommended)
@@ -83,7 +87,7 @@ npx @cognitionai/metabase-mcp-server
 # Load all tools
 npx @cognitionai/metabase-mcp-server --all
 
-# Load only write tools
+# Load read and write tools
 npx @cognitionai/metabase-mcp-server --write
 
 # Load only read-only tools
@@ -93,9 +97,14 @@ npx @cognitionai/metabase-mcp-server --read
 npm run build
 node dist/server.js                    # Default (essential tools)
 node dist/server.js --all             # All tools
-node dist/server.js --write           # Write tools only
+node dist/server.js --write           # Read and write tools
 node dist/server.js --read            # Read-only tools only
+METABASE_MCP_TOOLS=all node dist/server.js   # Same as --all
 ```
+
+For MongoDB databases, `execute_query` and `create_card` take the aggregation
+pipeline as a JSON string in `query` plus the `collection` it runs on, which
+Metabase requires.
 
 ## 🌐 HTTP Stream Transport (Shared Deployment)
 
@@ -357,6 +366,40 @@ Add to your Windsurf MCP config (`~/.windsurf/mcp_config.json`):
   }
 }
 ```
+
+## 🧱 Building dashboards end to end
+
+These tools let an assistant build and verify a whole dashboard through the MCP,
+without falling back to the REST API. All of them are loaded in the default
+`essential` mode.
+
+| Tool | What it does |
+|---|---|
+| `put_dashboard_layout` | Writes the whole layout in one PUT: tabs, every card and text block, filters and width. Validates the 24-column grid, tabs, ids and filter mappings first, lists anything it would delete (needs `confirm_removals: true`), supports `dry_run` |
+| `manage_dashboard_tabs` | Creates, renames, reorders and deletes tabs. Never deletes cards silently: cards of a deleted tab need `move_cards_from_deleted_to` |
+| `set_dashboard_filters` | Sets the filters and connects each one to the `{{variable}}` it feeds in every native card (`map_by_tag`), checking filter and variable types |
+| `run_dashcards` | Runs every card the way the dashboard does, with optional filter values, and reports ok / empty / error per card |
+| `test_native_query` | Runs SQL with `{{variables}}` without saving it, sending values as a dashboard filter would |
+| `create_card` / `update_card` | Declare a template tag for every `{{variable}}` in the SQL (`template_tags` sets types); `update_card` takes a `sql` shortcut that keeps the card's query format |
+| `execute_query` / `create_card` | Take `collection` for MongoDB native queries |
+
+Also essential now: `add_text_block`, `update_dashboard`, `update_dashcard`,
+`revert_dashboard` and `get_dashboard_revisions`. Every layout write returns
+`previous_revision_id`, so `revert_dashboard` can undo it, and keeps the dashboard's
+tabs (a PUT with cards but no tabs would otherwise delete every tab).
+
+Example flow:
+
+1. `create_card` with `query: "SELECT ... WHERE mes = {{p_mes}} [[AND tier = {{p_tier}}]]"`
+   and `template_tags: {p_mes: {type: "date"}}`.
+2. `put_dashboard_layout` with `dry_run: true`, then for real:
+   `tabs: [{id: -1, name: "Resumen"}]`, `dashcards: [{id: -1, dashboard_tab_id: -1, row: 0,
+   col: 0, size_x: 24, size_y: 2, text: "## Ranking", display: "heading"}, {id: -2, card_id: 123,
+   dashboard_tab_id: -1, row: 2, col: 0, size_x: 12, size_y: 6}]`.
+3. `set_dashboard_filters` with `parameters: [{id: "f_mes", name: "Mes", slug: "mes",
+   type: "date/month-year", sectionId: "date"}, {id: "f_tier", name: "Tier", slug: "tier",
+   type: "string/=", sectionId: "string"}]` and `map_by_tag: {f_mes: "p_mes", f_tier: "p_tier"}`.
+4. `run_dashcards` with no values and with `values: {f_mes: "2026-09"}`: expect 0 errors.
 
 ## 🛠️ Available Tools
 

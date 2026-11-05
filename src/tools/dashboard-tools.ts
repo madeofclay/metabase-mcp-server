@@ -147,7 +147,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "get_dashboard_revisions",
     description:
       "Retrieve revision history for a Metabase dashboard - use this to track dashboard evolution, review past changes, or restore previous versions",
-    metadata: { isRead: true },
+    metadata: { isEssential: true, isRead: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
     }).strict(),
@@ -465,6 +465,174 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     },
   });
 
+  server.addTool({
+    name: "run_dashcards",
+    description:
+      "Run every question of a dashboard (or one tab) the way the dashboard runs it, applying its filter mappings, and report per card ok | empty | error with row counts. Use it to verify a dashboard before sharing it, with no filters and with filter values (values: {filter_id: value}; string filters take a string or a list, date filters a string such as '2026-12'). Cards with hide_empty: true are expected to be empty sometimes. Runs at most 3 queries at a time.",
+    metadata: { isRead: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      tab: z.union([z.number(), z.string()]).optional().describe("Only this tab: its id or name"),
+      values: z.record(z.unknown()).optional().describe("Filter values by filter id; filters not given are left empty"),
+    }).strict(),
+    execute: async (args: { dashboard_id: number; tab?: number | string; values?: Record<string, unknown> }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.runDashcards(args.dashboard_id, { tab: args.tab, values: args.values });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to run the cards of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
+  server.addTool({
+    name: "set_dashboard_filters",
+    description:
+      "Set a dashboard's filters and connect them to the {{variables}} of its native SQL cards in one call. parameters is the FULL filter list (e.g. {id:'f_mes', name:'Mes', slug:'mes', type:'date/month-year', sectionId:'date'}; for a fixed list add values_source_type:'static-list', values_source_config:{values:[...]}). map_by_tag says which variable each filter feeds ({f_mes:'p_mes'}): every native card with that variable gets the mapping, unless listed in exclude. Filter and variable types must match (date/* → date, string/* → text, number/* → number). Mappings of other filters are kept. Use dry_run: true to preview. Reports per card what got mapped and which filters do not apply.",
+    metadata: { isWrite: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      parameters: z.array(z.object({ id: z.string() }).passthrough()).describe("Every filter the dashboard should have"),
+      map_by_tag: z.record(z.string()).describe("Filter id → variable name it feeds in the cards' SQL"),
+      exclude: z
+        .array(z.object({ dashcard_id: z.number(), parameter_id: z.string() }).strict())
+        .optional()
+        .describe("Dashcard/filter pairs to leave unconnected"),
+      dry_run: z.boolean().optional().describe("Validate and show the mappings without writing"),
+    }).strict(),
+    execute: async (args: {
+      dashboard_id: number;
+      parameters: any[];
+      map_by_tag: Record<string, string>;
+      exclude?: { dashcard_id: number; parameter_id: string }[];
+      dry_run?: boolean;
+    }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.setDashboardFilters(args.dashboard_id, args.parameters, args.map_by_tag, {
+          exclude: args.exclude,
+          dryRun: args.dry_run,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to set the filters of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
+  server.addTool({
+    name: "put_dashboard_layout",
+    description:
+      "Write a dashboard's WHOLE layout in one atomic call: tabs, every card and text block, and optionally filters and width. dashcards is the COMPLETE list: positive id = existing dashcard (kept/moved), negative id = new one; any current dashcard missing from the list is DELETED and needs confirm_removals: true (same for tabs). New tabs use negative ids that dashcards reference in dashboard_tab_id. Text/heading blocks can be given as {id: -n, text: '## ...', display: 'text'|'heading', dashboard_tab_id, row, col, size_x, size_y}. Validates before writing (24-column grid, tabs, unique ids, filter mappings). Use dry_run: true first to see the diff and what would be removed. Returns real tab ids and previous_revision_id to undo with revert_dashboard.",
+    metadata: { isWrite: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      tabs: z
+        .array(z.object({
+          id: z.number().optional().describe("Existing tab id, or a negative id for a new tab (needed if dashcards point at it)"),
+          name: z.string().min(1).describe("Tab name"),
+        }).strict())
+        .optional()
+        .describe("Every tab, in display order. Omit to keep the current tabs"),
+      dashcards: z
+        .array(z.object({
+          id: z.number().describe("Dashcard id: positive = existing, negative = new"),
+          card_id: z.number().nullable().optional().describe("Saved question shown; null/omitted for text and heading blocks"),
+          dashboard_tab_id: z.number().optional().describe("Tab id (required when the dashboard has tabs)"),
+          row: z.number().describe("Row (0 = top)"),
+          col: z.number().describe("Column, 0-23"),
+          size_x: z.number().describe("Width in columns; col + size_x <= 24"),
+          size_y: z.number().describe("Height in rows"),
+          text: z.string().optional().describe("Shorthand for a text block: its Markdown"),
+          display: z.enum(["text", "heading"]).optional().describe("With text: block kind (default text)"),
+          parameter_mappings: z.array(z.object({}).passthrough()).optional().describe("Filter mappings: {parameter_id, card_id, target}"),
+          visualization_settings: z.object({}).passthrough().optional(),
+          series: z.array(z.object({}).passthrough()).optional(),
+          inline_parameters: z.array(z.unknown()).optional(),
+          action_id: z.number().nullable().optional(),
+        }).passthrough())
+        .describe("Every dashcard the dashboard should have"),
+      parameters: z
+        .array(z.object({}).passthrough())
+        .optional()
+        .describe("Full filter definitions; omit to keep the current filters"),
+      width: z.enum(["fixed", "full"]).optional().describe("Dashboard width"),
+      dry_run: z.boolean().optional().describe("Validate and show the diff without writing"),
+      confirm_removals: z.boolean().optional().describe("Required when the layout deletes dashcards or tabs"),
+    }).strict(),
+    execute: async (args: any, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const { dashboard_id, dry_run, confirm_removals, ...layout } = args;
+        const result = await metabaseClient.putDashboardLayout(dashboard_id, layout, {
+          dryRun: dry_run,
+          confirmRemovals: confirm_removals,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to write the layout of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
+  server.addTool({
+    name: "manage_dashboard_tabs",
+    description:
+      "Create, rename, reorder or delete a dashboard's tabs in one call. Pass the FULL list of tabs in the desired order: a tab without id is created, an existing tab missing from the list is deleted. Cards are never deleted silently: if a deleted tab has cards, pass move_cards_from_deleted_to (a tab id from the new list, or its position, 0 = first). A dashboard without tabs that gets tabs moves all its cards to the first one. Removing every tab needs confirm: true. Use dry_run: true to preview. Returns the tabs with their real ids, what moved, and previous_revision_id to undo with revert_dashboard.",
+    metadata: { isWrite: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      tabs: z
+        .array(z.object({
+          id: z.number().optional().describe("Existing tab id to keep, rename or move; omit for a new tab"),
+          name: z.string().min(1).describe("Tab name"),
+        }).strict())
+        .describe("Every tab the dashboard should have, in display order"),
+      move_cards_from_deleted_to: z
+        .number()
+        .optional()
+        .describe("Where the cards of deleted tabs go: a tab id from the new list, or its position in it (0 = first)"),
+      dry_run: z.boolean().optional().describe("Validate and show what would change, without writing"),
+      confirm: z.boolean().optional().describe("Required to remove every tab"),
+    }).strict(),
+    execute: async (args: {
+      dashboard_id: number;
+      tabs: { id?: number; name: string }[];
+      move_cards_from_deleted_to?: number;
+      dry_run?: boolean;
+      confirm?: boolean;
+    }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.manageDashboardTabs(args.dashboard_id, args.tabs, {
+          moveCardsFromDeletedTo: args.move_cards_from_deleted_to,
+          dryRun: args.dry_run,
+          confirm: args.confirm,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to update the tabs of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
   /**
    * Add a text block or heading to a dashboard
    *
@@ -485,7 +653,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "add_text_block",
     description:
       "Add a text block or heading to a dashboard - use this for explanatory text, titles, or instructions",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       text: z.string().describe("The text content (supports Markdown)"),
@@ -600,7 +768,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "revert_dashboard",
     description:
       "Restore a dashboard to a specific previous revision - use this to undo changes, restore deleted content, or return to known good configuration",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       revision_id: z.number().describe("The revision ID to revert to"),
@@ -720,7 +888,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "update_dashboard",
     description:
       "Update dashboard properties including name, description, parameters, and settings - use this to maintain metadata, reorganize content, or configure sharing",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard to update"),
       name: z.string().optional().describe("New name for the dashboard"),
@@ -808,7 +976,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
         .array(
           z
             .object({
-              id: z.number().describe("Card ID"),
+              id: z.number().describe("Dashcard ID (the id inside the dashboard's dashcards, not card_id); negative for a new dashcard"),
               size_x: z.number().optional().describe("Width of the card"),
               size_y: z.number().optional().describe("Height of the card"),
               row: z.number().optional().describe("Row position"),
@@ -1110,7 +1278,7 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     name: "update_dashcard",
     description:
       "Update a specific dashcard's properties without affecting other cards - use for parameter_mappings, visualization_settings, position, or size changes. Much safer than update_dashboard_cards.",
-    metadata: { isWrite: true },
+    metadata: { isEssential: true, isWrite: true },
     parameters: z.object({
       dashboard_id: z.number().describe("The ID of the dashboard"),
       dashcard_id: z.number().describe("The dashcard 'id' field (not card_id)"),

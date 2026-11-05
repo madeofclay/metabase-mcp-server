@@ -358,24 +358,62 @@ export function addDatabaseTools(server: any, getClient: (ctx?: any) => Metabase
    */
   server.addTool({
     name: "execute_query",
-    description: "Execute a native SQL query against a Metabase database - use this for custom data analysis, complex queries, or extracting specific data not available through existing cards",
+    description: "Execute a native query against a Metabase database - use this for custom data analysis, complex queries, or extracting specific data not available through existing cards. For SQL databases, query is SQL. For MongoDB databases, query is the aggregation pipeline as a JSON string (e.g. '[{\"$match\":{\"status\":\"open\"}},{\"$limit\":10}]') and collection is required",
     metadata: { isEssential: true},
     parameters: z.object({
       database_id: z.number().describe("The ID of the database to query against"),
-      query: z.string().describe("The SQL query to execute"),
+      query: z.string().describe("The SQL query, or for MongoDB the aggregation pipeline as a JSON string"),
+      collection: z.string().optional().describe("MongoDB only, and required there: the collection the pipeline runs on"),
       parameters: z.array(z.object({
         type: z.string().optional().describe("Parameter type (e.g. 'category', 'date')"),
         target: z.array(z.unknown()).optional().describe("Target specification"),
         value: z.unknown().describe("Parameter value"),
       }).passthrough()).optional().describe("Optional query parameters for parameterized queries"),
     }).strict(),
-    execute: async (args: { database_id: number; query: string; parameters?: any[] }, context: any) => {
+    execute: async (args: { database_id: number; query: string; collection?: string; parameters?: any[] }, context: any) => {
       const metabaseClient = getClient(context);
       try {
-        const result = await metabaseClient.executeQuery(args.database_id, args.query, args.parameters || []);
+        const result = await metabaseClient.executeQuery(args.database_id, args.query, args.parameters || [], args.collection);
         return JSON.stringify(result, null, 2);
       } catch (error) {
         throw new Error(`Failed to execute query on database ${args.database_id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    },
+  });
+
+  server.addTool({
+    name: "test_native_query",
+    description:
+      "Try a native SQL query with {{variables}} without saving it, sending values the way a dashboard filter would. template_tags sets variable types (date | text | number, default text); values gives a value per variable; filter_types says which dashboard filter type sends it (e.g. {p_mes: 'date/month-year', p_tier: 'string/='}). Optional [[ ]] clauses without a value drop out. For MongoDB pass collection and the pipeline as query. Returns columns, the first rows, row_count, the SQL as Metabase ran it, or the error.",
+    metadata: { isRead: true, isEssential: true },
+    parameters: z.object({
+      database_id: z.number().describe("The ID of the database"),
+      sql: z.string().describe("The SQL (or, for MongoDB, the pipeline as a JSON string)"),
+      template_tags: z
+        .record(z.object({
+          type: z.enum(["date", "text", "number"]).optional(),
+          display_name: z.string().optional(),
+        }).strict())
+        .optional()
+        .describe("Variable types by name; not listed = text"),
+      values: z.record(z.unknown()).optional().describe("Value per variable name"),
+      filter_types: z.record(z.string()).optional().describe("Dashboard filter type that sends each variable's value"),
+      collection: z.string().optional().describe("MongoDB only: the collection"),
+      limit_rows: z.number().optional().describe("Rows to return (default 20)"),
+    }).strict(),
+    execute: async (args: any, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.testNativeQuery(args.database_id, args.sql, {
+          templateTags: args.template_tags,
+          values: args.values,
+          filterTypes: args.filter_types,
+          collection: args.collection,
+          limitRows: args.limit_rows,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(`Failed to test the query on database ${args.database_id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     },
   });

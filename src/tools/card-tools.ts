@@ -1,5 +1,25 @@
 import { z } from "zod";
 import { MetabaseClient } from "../client/metabase-client.js";
+import { TagOverride, buildTemplateTags, tagObject } from "../utils/template-tags.js";
+
+const TEMPLATE_TAGS_PARAM = z
+  .record(z.object({
+    type: z.enum(["date", "text", "number"]).optional().describe("Variable type (default text)"),
+    display_name: z.string().optional().describe("Label shown for the variable"),
+  }).strict())
+  .optional()
+  .describe("Types and labels for {{variables}} in the SQL, by name. Variables not listed are text");
+
+/** A new card's native query, legacy format: tags as an object keyed by name. */
+function nativeWithTags(query: string, collection?: string, templateTags?: Record<string, TagOverride>) {
+  const native: Record<string, unknown> = { query };
+  if (collection) native.collection = collection;
+  else {
+    const tags = buildTemplateTags(query, 'new', templateTags || {});
+    if (tags.length) native['template-tags'] = tagObject(tags);
+  }
+  return native;
+}
 
 export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClient) {
 
@@ -87,7 +107,9 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
     parameters: z.object({
       name: z.string().describe("Card name"),
       database_id: z.number().describe("Database ID to run the query against"),
-      query: z.string().describe("Native SQL query string (e.g. 'SELECT * FROM orders LIMIT 10')"),
+      query: z.string().describe("Native SQL query string (e.g. 'SELECT * FROM orders LIMIT 10'), or for MongoDB the aggregation pipeline as a JSON string"),
+      collection: z.string().optional().describe("MongoDB only, and required there: the collection the pipeline runs on"),
+      template_tags: TEMPLATE_TAGS_PARAM,
       description: z.string().optional().describe("Card description"),
       collection_id: z.number().optional().describe("Collection ID to save the card in"),
       display: z.string().optional().describe("Visualization type: table, bar, line, pie, scalar, etc. Defaults to 'table'"),
@@ -105,7 +127,7 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
           dataset_query: {
             database: args.database_id,
             type: "native",
-            native: { query: args.query },
+            native: nativeWithTags(args.query, args.collection, args.template_tags),
           },
           display: args.display || "table",
           visualization_settings: args.visualization_settings || {},
@@ -137,11 +159,13 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
    */
   server.addTool({
     name: "update_card",
-    description: "Modify an existing Metabase card's name, description, query definition, visualization type, or settings - use this to fix broken cards, change chart types, update queries, or move cards between collections",
+    description: "Modify an existing Metabase card's name, description, query definition, visualization type, or settings - use this to fix broken cards, change chart types, update queries, or move cards between collections. To change a native question's SQL, pass sql (and template_tags for variable types): the query keeps its format and every {{variable}} gets its template tag.",
     metadata: { isWrite: true, isEssential: true },
     parameters: z.object({
       card_id: z.number().describe("Card ID"),
-      updates: z.object({}).passthrough().describe("Fields to update"),
+      updates: z.object({}).passthrough().optional().describe("Fields to update"),
+      sql: z.string().optional().describe("New SQL for a native question; template tags are declared for every {{variable}}"),
+      template_tags: TEMPLATE_TAGS_PARAM,
       query_params: z
         .object({})
         .passthrough()
@@ -150,11 +174,19 @@ export function addCardTools(server: any, getClient: (ctx?: any) => MetabaseClie
     }).strict(),
     execute: async (args: {
       card_id: number;
-      updates: any;
+      updates?: any;
+      sql?: string;
+      template_tags?: Record<string, { type?: "date" | "text" | "number"; display_name?: string }>;
       query_params?: any;
     }, context: any) => {
       const metabaseClient = getClient(context);
       try {
+        if (args.sql !== undefined) {
+          const result = await metabaseClient.updateCardSql(args.card_id, args.sql, args.template_tags, args.updates);
+          return JSON.stringify(result, null, 2);
+        }
+        if (args.template_tags) throw new Error("template_tags needs sql");
+        if (!args.updates) throw new Error("Pass updates or sql");
         const card = await metabaseClient.updateCard(
           args.card_id,
           args.updates,
