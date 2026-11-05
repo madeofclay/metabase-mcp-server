@@ -24,6 +24,15 @@
  *   REFRESH_TOKEN_EXPIRY   Refresh token expiry             (default: 30d)
  *   MCP_RESOURCE_URI       Public URI of the MCP endpoint   (default: GATEWAY_URL/mcp)
  *                          Set this when a proxy exposes /mcp under a path prefix.
+ *
+ * Server-side Google sign-in (optional; see src/google-sso.ts). When enabled, a
+ * Google SSO connection survives Metabase's session expiry: on refresh, the
+ * gateway mints a new Metabase session from the user's Google refresh token.
+ *   GOOGLE_CLIENT_ID       Metabase's Google OAuth client id (enables the flow)
+ *   GOOGLE_CLIENT_SECRET   Its secret (env var or vault key METABASE_MCP_GOOGLE_CLIENT_SECRET)
+ *   GOOGLE_REDIRECT_URI    Callback registered in that client (default: GATEWAY_URL/oauth/google/callback)
+ *   METABASE_SESSION_RENEW_DAYS  Renew a session this old on refresh (default: 12,
+ *                          below Metabase's 14-day MAX_SESSION_AGE default)
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -32,6 +41,17 @@ import { URL } from 'url';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { hydrateEnvFromVault, vaultName } from './utils/secrets.js';
+import { Credentials, CredentialSealer, credentialsFromPayload, pickCredentials } from './credentials.js';
+import {
+  GoogleConfig,
+  GoogleGrantRejected,
+  MetabaseRejected,
+  exchangeGoogleCode,
+  googleAuthUrl,
+  metabaseSessionAlive,
+  metabaseSessionFromGoogle,
+  refreshGoogleIdToken,
+} from './google-sso.js';
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 
@@ -76,18 +96,42 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 log('info', `JWT_SECRET loaded from ${secretOrigin.JWT_SECRET}`);
 
+const sealer = new CredentialSealer(JWT_SECRET);
+
+// Server-side Google sign-in is on only when Metabase's Google client is fully
+// configured. Without it the authorize page keeps the browser-only Google flow,
+// whose Metabase session cannot be renewed.
+async function loadGoogleConfig(): Promise<GoogleConfig | null> {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  if (!clientId) return null;
+  try {
+    await hydrateEnvFromVault({ GOOGLE_CLIENT_SECRET: 'METABASE_MCP_GOOGLE_CLIENT_SECRET' });
+  } catch (err) {
+    log('warn', `Google client secret unavailable: ${(err as Error).message}`);
+  }
+  if (!process.env.GOOGLE_CLIENT_SECRET) {
+    log('warn', 'GOOGLE_CLIENT_ID is set but GOOGLE_CLIENT_SECRET is not — server-side Google sign-in disabled');
+    return null;
+  }
+  return {
+    clientId,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI || `${GATEWAY_URL}/oauth/google/callback`,
+  };
+}
+
+const GOOGLE = await loadGoogleConfig();
+log('info', `Server-side Google sign-in ${GOOGLE ? `enabled (callback ${GOOGLE.redirectUri})` : 'disabled'}`);
+
+const SESSION_RENEW_AFTER_S = Math.round(parseFloat(process.env.METABASE_SESSION_RENEW_DAYS || '12') * 86400);
+
 // ── Pending authorization codes (in-memory, 10-min TTL) ─────────────────────
 
-interface PendingCode {
-  metabase_url: string;
-  metabase_api_key?: string;
-  metabase_username?: string;
-  metabase_password?: string;
-  metabase_session_token?: string;
+type PendingCode = Credentials & {
   code_challenge?: string;   // PKCE
   redirect_uri: string;
   expires: number;
-}
+};
 
 const pendingCodes = new Map<string, PendingCode>();
 
@@ -120,43 +164,33 @@ function verifyPkce(verifier: string, challenge: string): boolean {
 // The JWT carries the Metabase credentials, so it *is* the credential: there is
 // no server-side session to look up. Access tokens are therefore short-lived and
 // renewed through a rotating refresh token rather than simply given a long life.
-
-interface Credentials {
-  metabase_url: string;
-  metabase_api_key?: string;
-  metabase_username?: string;
-  metabase_password?: string;
-  metabase_session_token?: string;
-}
-
-function credentialsFrom(src: Record<string, any>): Credentials {
-  const creds: Credentials = { metabase_url: src.metabase_url };
-  if (src.metabase_api_key)       creds.metabase_api_key       = src.metabase_api_key;
-  if (src.metabase_username)      creds.metabase_username      = src.metabase_username;
-  if (src.metabase_password)      creds.metabase_password      = src.metabase_password;
-  if (src.metabase_session_token) creds.metabase_session_token = src.metabase_session_token;
-  return creds;
-}
+// The credentials travel sealed (src/credentials.ts): a JWT is only signed, and
+// anyone holding one could otherwise read the API key, password or session in it.
 
 // Stable, non-reversible id for a connection so logs can correlate one user's
 // tokens across issuance, refresh and expiry without ever recording a credential.
+// A Google connection is keyed on the Google account, since its Metabase session
+// changes every time the gateway renews it.
 function subjectOf(creds: Credentials): string {
-  const material = [
-    creds.metabase_url,
-    creds.metabase_username || '',
-    creds.metabase_api_key || creds.metabase_password || creds.metabase_session_token || '',
-  ].join('|');
+  const material = creds.google_subject
+    ? [creds.metabase_url, 'google', creds.google_subject].join('|')
+    : [
+        creds.metabase_url,
+        creds.metabase_username || '',
+        creds.metabase_api_key || creds.metabase_password || creds.metabase_session_token || '',
+      ].join('|');
   return crypto.createHash('sha256').update(material).digest('hex').slice(0, 12);
 }
 
-function issueTokens(creds: Credentials) {
+function issueTokens(creds: Credentials, accessExpiry: string = TOKEN_EXPIRY) {
   const sub = subjectOf(creds);
   // A unique jti per token: HMAC over an identical payload is deterministic, so
   // without it two tokens minted in the same second are byte-identical and
   // rotating the refresh token would hand back the very token it replaces.
   const jti = () => crypto.randomBytes(16).toString('hex');
-  const access  = jwt.sign({ ...creds, sub, jti: jti(), typ: 'access', aud: RESOURCE_URI }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY } as jwt.SignOptions);
-  const refresh = jwt.sign({ ...creds, sub, jti: jti(), typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY } as jwt.SignOptions);
+  const claims = { metabase_url: creds.metabase_url, cred: sealer.seal(creds), sub };
+  const access  = jwt.sign({ ...claims, jti: jti(), typ: 'access', aud: RESOURCE_URI }, JWT_SECRET, { expiresIn: accessExpiry } as jwt.SignOptions);
+  const refresh = jwt.sign({ ...claims, jti: jti(), typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY } as jwt.SignOptions);
   const { iat, exp } = jwt.decode(access)  as { iat: number; exp: number };
   const refreshExp   = (jwt.decode(refresh) as { exp: number }).exp;
   return {
@@ -292,6 +326,127 @@ app.post('/oauth/metabase-google-auth', async (req: Request, res: Response) => {
     res.json({ session_token: data.id });
   } catch {
     res.status(502).json({ error: 'could not reach Metabase' });
+  }
+});
+
+// ── Server-side Google sign-in ───────────────────────────────────────────────
+// The authorize page sends the browser here instead of using Google's in-page
+// sign-in, so that the gateway — not the browser — receives a Google refresh
+// token it can use to renew the Metabase session later (src/google-sso.ts).
+//
+// The client's OAuth parameters ride through Google inside a signed `state`, and
+// a nonce cookie binds that state to the browser that started the flow, so a
+// callback URL lured onto someone else's browser cannot complete their sign-in.
+
+const GOOGLE_NONCE_COOKIE = 'mbmcp_google_nonce';
+const GOOGLE_STATE_TTL_S = 10 * 60;
+
+function htmlMessage(res: Response, status: number, message: string) {
+  res.status(status).setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Conectar Metabase · MCP</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f5;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:1rem">
+<div style="background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.10);padding:2rem;max-width:420px">
+<h1 style="font-size:1.25rem;margin:0 0 .5rem">No se pudo conectar Metabase</h1>
+<p style="color:#444;font-size:.9rem;margin:0">${escapeHtml(message)}</p></div></body></html>`);
+}
+
+function readCookie(req: Request, name: string): string | undefined {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return undefined;
+}
+
+function nonceCookie(value: string, maxAge: number): string {
+  const secure = GATEWAY_URL.startsWith('https://') ? '; Secure' : '';
+  return `${GOOGLE_NONCE_COOKIE}=${value}; Path=/oauth/google; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+}
+
+app.get('/oauth/google/start', (req: Request, res: Response) => {
+  if (!GOOGLE) {
+    res.status(404).send('Server-side Google sign-in is not configured');
+    return;
+  }
+  const { redirect_uri, state, code_challenge, code_challenge_method, metabase_url } = req.query as Record<string, string>;
+  if (!redirect_uri || !metabase_url) {
+    res.status(400).send('redirect_uri and metabase_url are required');
+    return;
+  }
+
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const googleState = jwt.sign(
+    { typ: 'google_state', nonce, redirect_uri, state, code_challenge, code_challenge_method, metabase_url },
+    JWT_SECRET,
+    { expiresIn: GOOGLE_STATE_TTL_S },
+  );
+  res.setHeader('Set-Cookie', nonceCookie(nonce, GOOGLE_STATE_TTL_S));
+  res.redirect(googleAuthUrl(GOOGLE, googleState));
+});
+
+app.get('/oauth/google/callback', async (req: Request, res: Response) => {
+  if (!GOOGLE) {
+    res.status(404).send('Server-side Google sign-in is not configured');
+    return;
+  }
+  const { code, state, error } = req.query as Record<string, string>;
+
+  let flow: Record<string, any>;
+  try {
+    flow = jwt.verify(state || '', JWT_SECRET) as Record<string, any>;
+    if (flow.typ !== 'google_state') throw new Error('wrong state type');
+  } catch {
+    htmlMessage(res, 400, 'La sesión de inicio expiró o no es válida. Vuelve a conectar desde Claude.');
+    return;
+  }
+  if (!flow.nonce || readCookie(req, GOOGLE_NONCE_COOKIE) !== flow.nonce) {
+    htmlMessage(res, 400, 'El inicio de sesión no se originó en este navegador. Vuelve a conectar desde Claude.');
+    return;
+  }
+  res.append('Set-Cookie', nonceCookie('', 0));
+
+  if (error || !code) {
+    // The user cancelled at Google, or Google refused: tell the client, per RFC 6749 §4.1.2.1.
+    const back = new URL(flow.redirect_uri);
+    back.searchParams.set('error', 'access_denied');
+    if (flow.state) back.searchParams.set('state', flow.state);
+    res.redirect(back.toString());
+    return;
+  }
+
+  try {
+    const google = await exchangeGoogleCode(GOOGLE, code);
+    if (!google.refreshToken) {
+      log('warn', 'Google sign-in returned no refresh token');
+      htmlMessage(res, 502, 'Google no entregó un permiso de acceso prolongado. Vuelve a intentarlo.');
+      return;
+    }
+    const session = await metabaseSessionFromGoogle(flow.metabase_url, google.idToken);
+
+    const authCode = crypto.randomBytes(32).toString('hex');
+    pendingCodes.set(authCode, {
+      metabase_url: flow.metabase_url,
+      metabase_session_token: session,
+      metabase_session_issued_at: Math.floor(Date.now() / 1000),
+      google_refresh_token: google.refreshToken,
+      google_subject: google.subject,
+      code_challenge: flow.code_challenge_method === 'S256' ? flow.code_challenge : undefined,
+      redirect_uri: flow.redirect_uri,
+      expires: Date.now() + 10 * 60 * 1000,
+    });
+
+    const back = new URL(flow.redirect_uri);
+    back.searchParams.set('code', authCode);
+    if (flow.state) back.searchParams.set('state', flow.state);
+    res.redirect(back.toString());
+  } catch (err) {
+    if (err instanceof MetabaseRejected) {
+      log('info', `Google sign-in refused by Metabase status=${err.status}`);
+      htmlMessage(res, 403, 'Metabase no aceptó esta cuenta de Google. Revisa que tengas usuario en Metabase.');
+      return;
+    }
+    log('error', `Google sign-in failed: ${(err as Error).message}`);
+    htmlMessage(res, 502, 'No se pudo completar el inicio de sesión con Google. Vuelve a intentarlo.');
   }
 });
 
@@ -493,9 +648,24 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
       });
     }
 
+    // Server-side flow: the gateway signs in with Google itself and keeps a
+    // refresh token, so the connection outlives Metabase's session expiry.
+    var GOOGLE_SERVER_FLOW = ${GOOGLE ? 'true' : 'false'};
+
+    function startGoogleServerFlow(url) {
+      var params = new URLSearchParams();
+      ['redirect_uri', 'state', 'code_challenge', 'code_challenge_method'].forEach(function (name) {
+        params.set(name, document.querySelector('input[name="' + name + '"]').value);
+      });
+      params.set('metabase_url', url);
+      setStatus('Redirigiendo a Google...', '');
+      window.location.href = '/oauth/google/start?' + params.toString();
+    }
+
     async function startGoogleSSO() {
       var url = document.getElementById('metabase_url').value.trim();
       if (!url) { setStatus('Primero ingresa la URL de Metabase.', 'err'); return; }
+      if (GOOGLE_SERVER_FLOW) { startGoogleServerFlow(url); return; }
 
       var btn = document.getElementById('btn-google');
       btn.disabled = true;
@@ -616,6 +786,7 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
     metabase_username:      metabase_username      || undefined,
     metabase_password:      metabase_password      || undefined,
     metabase_session_token: metabase_session_token || undefined,
+    metabase_session_issued_at: metabase_session_token ? Math.floor(Date.now() / 1000) : undefined,
     code_challenge:         code_challenge_method === 'S256' ? code_challenge : undefined,
     redirect_uri,
     expires: Date.now() + 10 * 60 * 1000,
@@ -629,9 +800,81 @@ app.post('/oauth/authorize', (req: Request, res: Response) => {
 
 // ── Token endpoint ───────────────────────────────────────────────────────────
 
+// ── Metabase session renewal ─────────────────────────────────────────────────
+// Metabase expires a session MAX_SESSION_AGE after it was created (14 days by
+// default), however often it is used. Rotating our own tokens does not help once
+// that happens: every tool call fails until the user signs in again. So each
+// refresh also checks the Metabase session, and renews it from the Google refresh
+// token when it is old or already rejected.
+
+/** The Metabase session is gone and cannot be renewed: the user must sign in again. */
+class SessionGone extends Error {}
+
+// Short access token when renewal failed for a transient reason, so the client
+// comes back soon to try again instead of holding a dead session for hours.
+const RETRY_ACCESS_EXPIRY = '5m';
+
+async function renewMetabaseSession(creds: Credentials, sub: string, reason: string): Promise<Credentials> {
+  const google = await refreshGoogleIdToken(GOOGLE!, creds.google_refresh_token!);
+  const session = await metabaseSessionFromGoogle(creds.metabase_url, google.idToken);
+  log('info', `metabase session renewed sub=${sub} reason=${reason}`);
+  return {
+    ...creds,
+    metabase_session_token: session,
+    metabase_session_issued_at: Math.floor(Date.now() / 1000),
+    google_refresh_token: google.refreshToken || creds.google_refresh_token,
+    google_subject: google.subject || creds.google_subject,
+  };
+}
+
+/**
+ * The credentials to issue on a refresh, with a live Metabase session when that
+ * can be had. `degraded` means the session may be dead but could not be renewed
+ * for a transient reason. Throws SessionGone when the user must sign in again.
+ */
+async function freshCredentials(creds: Credentials, sub: string): Promise<{ creds: Credentials; degraded: boolean }> {
+  // API keys do not expire, and with a password the MCP server logs in by itself.
+  if (!creds.metabase_session_token) return { creds, degraded: false };
+
+  const renewable = Boolean(GOOGLE && creds.google_refresh_token);
+  const age = creds.metabase_session_issued_at !== undefined
+    ? Math.floor(Date.now() / 1000) - creds.metabase_session_issued_at
+    : undefined;
+
+  let alive: boolean | undefined;
+  let reason: string;
+  if (renewable && age !== undefined && age >= SESSION_RENEW_AFTER_S) {
+    reason = 'age';
+  } else {
+    alive = await metabaseSessionAlive(creds.metabase_url, creds.metabase_session_token);
+    if (alive !== false) return { creds, degraded: false };
+    if (!renewable) {
+      // Rotating our tokens around a dead session would only hide the failure
+      // inside every tool call; failing the refresh makes the client ask the
+      // user to reconnect.
+      log('info', `token refresh rejected reason=metabase_session_expired sub=${sub}`);
+      throw new SessionGone();
+    }
+    reason = 'rejected';
+  }
+
+  try {
+    return { creds: await renewMetabaseSession(creds, sub, reason), degraded: false };
+  } catch (err) {
+    if (err instanceof GoogleGrantRejected || (err instanceof MetabaseRejected && err.status < 500)) {
+      log('info', `token refresh rejected reason=session_renewal_refused sub=${sub} detail=${err.message}`);
+      throw new SessionGone();
+    }
+    // Google or Metabase unreachable. An old-but-valid session is still good, so
+    // keep it; a rejected one is kept too, but only on a short-lived token.
+    log('warn', `metabase session renewal failed sub=${sub} reason=${reason} error=${(err as Error).message}`);
+    return { creds, degraded: alive === false };
+  }
+}
+
 // Refresh grant — the client trades a refresh token for a fresh pair. The refresh
 // token is rotated on every use so that a leaked one has a bounded life.
-function handleRefresh(req: Request, res: Response) {
+async function handleRefresh(req: Request, res: Response) {
   const { refresh_token } = req.body as Record<string, string>;
 
   if (!refresh_token) {
@@ -659,16 +902,36 @@ function handleRefresh(req: Request, res: Response) {
     return;
   }
 
-  const { sub, body } = issueTokens(credentialsFrom(payload));
+  let creds: Credentials;
+  try {
+    creds = credentialsFromPayload(payload, sealer);
+  } catch {
+    log('info', `token refresh rejected reason=unreadable_credentials sub=${payload.sub || '-'}`);
+    res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token invalid' });
+    return;
+  }
+
+  let fresh: { creds: Credentials; degraded: boolean };
+  try {
+    fresh = await freshCredentials(creds, payload.sub || subjectOf(creds));
+  } catch (err) {
+    if (err instanceof SessionGone) {
+      res.status(400).json({ error: 'invalid_grant', error_description: 'Metabase session expired; sign in again' });
+      return;
+    }
+    throw err;
+  }
+
+  const { sub, body } = issueTokens(fresh.creds, fresh.degraded ? RETRY_ACCESS_EXPIRY : TOKEN_EXPIRY);
   log('info', `token refreshed sub=${sub} expires_in=${body.expires_in}`);
   res.json(body);
 }
 
-app.post('/oauth/token', (req: Request, res: Response) => {
+app.post('/oauth/token', async (req: Request, res: Response) => {
   const { grant_type, code, code_verifier } = req.body as Record<string, string>;
 
   if (grant_type === 'refresh_token') {
-    handleRefresh(req, res);
+    await handleRefresh(req, res);
     return;
   }
   if (grant_type !== 'authorization_code') {
@@ -702,7 +965,7 @@ app.post('/oauth/token', (req: Request, res: Response) => {
 
   pendingCodes.delete(code);
 
-  const { sub, body } = issueTokens(credentialsFrom(pending));
+  const { sub, body } = issueTokens(pickCredentials(pending));
   log('info', `token issued grant=authorization_code sub=${sub} expires_in=${body.expires_in}`);
   res.json(body);
 });
@@ -794,6 +1057,16 @@ app.use('/mcp', (req: Request, res: Response) => {
     return;
   }
 
+  let creds: Credentials;
+  try {
+    creds = credentialsFromPayload(payload, sealer);
+  } catch {
+    denial = 'unreadable_credentials';
+    challenge('invalid_token', 'Token invalid');
+    res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid' });
+    return;
+  }
+
   // notifications/initialized is a fire-and-forget notification — acknowledge immediately.
   // The upstream returns 400 when it receives this without a session context (stateless mode),
   // so we handle it at the gateway level instead of proxying.
@@ -811,11 +1084,11 @@ app.use('/mcp', (req: Request, res: Response) => {
     if (typeof v === 'string') proxyHeaders[k] = v;
     else if (Array.isArray(v)) proxyHeaders[k] = v[0];
   }
-  proxyHeaders['x-metabase-url'] = payload.metabase_url;
-  if (payload.metabase_api_key)       proxyHeaders['x-metabase-api-key']       = payload.metabase_api_key;
-  if (payload.metabase_username)      proxyHeaders['x-metabase-username']      = payload.metabase_username;
-  if (payload.metabase_password)      proxyHeaders['x-metabase-password']      = payload.metabase_password;
-  if (payload.metabase_session_token) proxyHeaders['x-metabase-session-token'] = payload.metabase_session_token;
+  proxyHeaders['x-metabase-url'] = creds.metabase_url;
+  if (creds.metabase_api_key)       proxyHeaders['x-metabase-api-key']       = creds.metabase_api_key;
+  if (creds.metabase_username)      proxyHeaders['x-metabase-username']      = creds.metabase_username;
+  if (creds.metabase_password)      proxyHeaders['x-metabase-password']      = creds.metabase_password;
+  if (creds.metabase_session_token) proxyHeaders['x-metabase-session-token'] = creds.metabase_session_token;
   proxyHeaders['host'] = upstream.host;
 
   const isGet = req.method === 'GET';

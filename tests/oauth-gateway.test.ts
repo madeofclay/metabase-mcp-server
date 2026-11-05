@@ -8,6 +8,15 @@ process.env.GATEWAY_URL = 'https://mcp.example.com';
 process.env.MCP_UPSTREAM = 'http://localhost:9999'; // unused in unit tests
 
 const { app } = await import('../src/oauth-gateway.js');
+const { CredentialSealer } = await import('../src/credentials.js');
+
+// Verifies a token and returns its claims with the sealed credentials opened,
+// so assertions can look at both the way the gateway does.
+const sealer = new CredentialSealer('test-secret-for-vitest');
+function decode(token: string): Record<string, any> {
+  const claims = jwt.verify(token, 'test-secret-for-vitest') as Record<string, any>;
+  return claims.cred ? { ...claims, ...sealer.open(claims.cred) } : claims;
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -192,7 +201,7 @@ describe('POST /oauth/token', () => {
     expect(res.body.access_token).toBeTruthy();
     expect(res.body.token_type).toBe('bearer');
 
-    const decoded = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(res.body.access_token);
     expect(decoded.metabase_url).toBe('https://metabase.example.com');
     expect(decoded.metabase_api_key).toBe('mb_real_key');
     expect(decoded.metabase_password).toBeUndefined();
@@ -205,7 +214,7 @@ describe('POST /oauth/token', () => {
       code,
     });
     expect(res.status).toBe(200);
-    const decoded = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(res.body.access_token);
     expect(decoded.metabase_username).toBe('admin@example.com');
     expect(decoded.metabase_api_key).toBeUndefined();
   });
@@ -257,7 +266,7 @@ describe('POST /oauth/authorize - malformed API key', () => {
     });
     const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
     const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
-    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.access_token);
 
     // The API key outranks every other credential downstream, so keeping it
     // would send a password as X-API-Key and earn a 401 from Metabase.
@@ -273,7 +282,7 @@ describe('POST /oauth/authorize - malformed API key', () => {
     });
     const code = new URL(res.headers['location'] as string).searchParams.get('code') as string;
     const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
-    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.access_token);
     expect(decoded.metabase_api_key).toBe('mb_realkey12345');
   });
 
@@ -334,14 +343,14 @@ describe('access token audience', () => {
   it('binds the access token to the MCP resource', async () => {
     const code = await getAuthCode({ apiKey: 'mb_aud_key' });
     const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
-    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.access_token);
     expect(decoded.aud).toBe('https://mcp.example.com/mcp');
   });
 
   it('leaves the refresh token unbound — it is redeemed at the AS, not the resource', async () => {
     const code = await getAuthCode({ apiKey: 'mb_aud_key' });
     const { body } = await request(app).post('/oauth/token').send({ grant_type: 'authorization_code', code });
-    const decoded = jwt.verify(body.refresh_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.refresh_token);
     expect(decoded.aud).toBeUndefined();
   });
 
@@ -394,13 +403,13 @@ describe('POST /oauth/token - refresh_token grant', () => {
     expect(body.refresh_token).toBeTruthy();
     expect(body.refresh_expires_in).toBeGreaterThan(body.expires_in);
 
-    const decoded = jwt.verify(body.refresh_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.refresh_token);
     expect(decoded.typ).toBe('refresh');
   });
 
   it('marks access tokens with typ=access', async () => {
     const body = await getTokenPair();
-    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.access_token);
     expect(decoded.typ).toBe('access');
   });
 
@@ -413,7 +422,7 @@ describe('POST /oauth/token - refresh_token grant', () => {
     expect(res.status).toBe(200);
     expect(res.body.access_token).toBeTruthy();
 
-    const decoded = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(res.body.access_token);
     expect(decoded.typ).toBe('access');
     expect(decoded.metabase_api_key).toBe('mb_refresh_key');
   });
@@ -424,7 +433,7 @@ describe('POST /oauth/token - refresh_token grant', () => {
       grant_type: 'refresh_token',
       refresh_token: body.refresh_token,
     });
-    const decoded = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(res.body.access_token);
     expect(decoded.metabase_username).toBe('admin@example.com');
     expect(decoded.metabase_password).toBe('secret');
     expect(decoded.metabase_api_key).toBeUndefined();
@@ -442,19 +451,19 @@ describe('POST /oauth/token - refresh_token grant', () => {
 
   it('keeps a stable subject across refreshes so logs can correlate', async () => {
     const body = await getTokenPair();
-    const first = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const first = decode(body.access_token);
     const res = await request(app).post('/oauth/token').send({
       grant_type: 'refresh_token',
       refresh_token: body.refresh_token,
     });
-    const second = jwt.verify(res.body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const second = decode(res.body.access_token);
     expect(second.sub).toBe(first.sub);
     expect(first.sub).toMatch(/^[0-9a-f]{12}$/);
   });
 
   it('never leaks a credential into the subject', async () => {
     const body = await getTokenPair({ apiKey: 'mb_super_secret' } as any);
-    const decoded = jwt.verify(body.access_token, 'test-secret-for-vitest') as Record<string, string>;
+    const decoded = decode(body.access_token);
     expect(decoded.sub).not.toContain('mb_super_secret');
   });
 

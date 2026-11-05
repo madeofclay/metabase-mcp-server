@@ -14,7 +14,7 @@ identity:
 
 infrastructure:
   runtime: node20
-  hosting: self-hosted (no evidencia de despliegue AWS en este repo — ver agent_notes)
+  hosting: "EC2 ai-agents-dev (gracia-dev) con supervisord + nginx, despliegue manual fuera de este repo (ver CLAUDE.md, Deploy)"
   region: "N/A - sin IaC en el repo"
   iac: none
   deploy_strategy: npm-publish
@@ -35,14 +35,21 @@ entrypoints:
     environments: [prod, develop]
     custom_domain: ~
   - type: oauth-gateway
-    description: "Gateway Express opcional (src/oauth-gateway.ts, GATEWAY_PORT 8080 por defecto) que implementa Authorization Code + PKCE para clientes OAuth (Claude.ai) y proxea a http-stream. Referencia hardcodeada a https://analytics.clay.cl/ como valor por defecto del formulario, confirmando uso real de Clay, pero sin manifiesto de despliegue en el repo."
-    environments: [prod, develop]
-    custom_domain: ~
+    description: "Gateway Express (src/oauth-gateway.ts) que implementa Authorization Code + PKCE para clientes OAuth (Claude.ai) y proxea a http-stream. Corre en ai-agents-dev, puerto 8012, publicado por nginx. Con GOOGLE_CLIENT_ID/SECRET hace el login de Google en el servidor (src/google-sso.ts) y renueva la sesión de Metabase en cada refresh."
+    environments: [develop]
+    custom_domain: data-dev.clay.cl
 
 dependencies:
   external_apis:
     - name: metabase
       description: "Instancia Metabase objetivo (ej. analytics.clay.cl), configurable vía METABASE_URL / header x-metabase-url"
+    - name: google-oauth
+      description: "Cliente OAuth del Google SSO de Metabase, usado por el gateway con acceso offline para renovar la sesión de Metabase"
+      environments: [develop]
+  secrets:
+    - vault: clay-data-secrets-{env}
+      keys: [METABASE_MCP_GATEWAY_SECRET, METABASE_MCP_GOOGLE_CLIENT_SECRET]
+      environments: [develop]
 
 owners:
   team: "clay-data"
