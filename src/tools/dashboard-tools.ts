@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { MetabaseClient } from "../client/metabase-client.js";
+import { isDestructiveAllowed, destructiveDisabledMessage } from "../utils/tool-filters.js";
 
 export function addDashboardTools(server: any, getClient: (ctx?: any) => MetabaseClient) {
   /**
@@ -573,6 +574,18 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
       const metabaseClient = getClient(context);
       try {
         const { dashboard_id, dry_run, confirm_removals, ...layout } = args;
+        if (!dry_run && !isDestructiveAllowed()) {
+          // Deleting dashcards or tabs is off: refuse a layout that would drop any.
+          const preview: any = await metabaseClient.putDashboardLayout(dashboard_id, layout, { dryRun: true });
+          const r = preview.removals || { dashcards: [], tabs: [] };
+          if ((r.dashcards?.length || 0) + (r.tabs?.length || 0) > 0) {
+            const items = [
+              ...(r.dashcards || []).map((d: any) => `dashcard ${d.id}${d.name ? ` (${d.name})` : ''}`),
+              ...(r.tabs || []).map((tb: any) => `tab ${tb.id}${tb.name ? ` (${tb.name})` : ''}`),
+            ];
+            throw new Error(destructiveDisabledMessage(`Deleting ${items.join(', ')}`));
+          }
+        }
         const result = await metabaseClient.putDashboardLayout(dashboard_id, layout, {
           dryRun: dry_run,
           confirmRemovals: confirm_removals,
@@ -617,6 +630,20 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
     }, context: any) => {
       const metabaseClient = getClient(context);
       try {
+        if (!args.dry_run && !isDestructiveAllowed()) {
+          // Deleting tabs is off: refuse a tab list that drops an existing tab.
+          const preview: any = await metabaseClient.manageDashboardTabs(args.dashboard_id, args.tabs, {
+            moveCardsFromDeletedTo: args.move_cards_from_deleted_to,
+            dryRun: true,
+            confirm: args.confirm,
+          });
+          const deleted = preview.deleted_tabs || [];
+          if (deleted.length > 0) {
+            throw new Error(destructiveDisabledMessage(
+              `Deleting ${deleted.map((tb: any) => `tab ${tb.id} (${tb.name})`).join(', ')}`
+            ));
+          }
+        }
         const result = await metabaseClient.manageDashboardTabs(args.dashboard_id, args.tabs, {
           moveCardsFromDeletedTo: args.move_cards_from_deleted_to,
           dryRun: args.dry_run,

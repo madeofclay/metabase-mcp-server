@@ -67,10 +67,19 @@ const WRITE = [
 /** Marking something as a favorite twice leaves it the same. */
 const IDEMPOTENT_WRITE = ['favorite_dashboard', 'unfavorite_dashboard'] as const;
 
+/**
+ * Write tools that can also delete, and refuse to unless destructive tools are
+ * allowed (--allow-destructive or --all): put_dashboard_layout without
+ * confirm_removals and manage_dashboard_tabs without deleting a tab only create
+ * and edit. They count as write tools then, and as destructive ones when
+ * deleting is allowed.
+ */
+export const GUARDED_TOOLS = ['put_dashboard_layout', 'manage_dashboard_tabs'] as const;
+
 const DESTRUCTIVE = [
-  // dashboards: these can drop dashcards or tabs, or roll back to an older version
-  'put_dashboard_layout', 'manage_dashboard_tabs', 'update_dashboard_cards',
-  'remove_cards_from_dashboard', 'revert_dashboard', 'delete_dashboard', 'delete_public_link',
+  // dashboards: these drop dashcards, replace them all, or roll back to an older version
+  'update_dashboard_cards', 'remove_cards_from_dashboard', 'revert_dashboard', 'delete_dashboard',
+  'delete_public_link',
   // databases: connection settings and the connection itself
   'update_database', 'delete_database',
   // cards
@@ -81,18 +90,27 @@ const DESTRUCTIVE = [
   'delete_collection',
 ] as const;
 
-const GROUPS = new Map<string, ToolGroup | 'idempotent-write'>();
+type Kind = ToolGroup | 'idempotent-write' | 'guarded';
+
+const GROUPS = new Map<string, Kind>();
 for (const n of READ) GROUPS.set(n, 'read');
 for (const n of WRITE) GROUPS.set(n, 'write');
 for (const n of IDEMPOTENT_WRITE) GROUPS.set(n, 'idempotent-write');
+for (const n of GUARDED_TOOLS) GROUPS.set(n, 'guarded');
 for (const n of DESTRUCTIVE) GROUPS.set(n, 'destructive');
 
 /** Every classified tool name, for tests. */
 export const CLASSIFIED_TOOLS: readonly string[] = [...GROUPS.keys()];
 
-export function toolGroup(name: string): ToolGroup | undefined {
+/**
+ * The group of a tool, or undefined when it is not classified. A guarded tool is
+ * a write tool unless destructive tools are allowed.
+ */
+export function toolGroup(name: string, allowDestructive = false): ToolGroup | undefined {
   const g = GROUPS.get(name);
-  return g === 'idempotent-write' ? 'write' : g;
+  if (g === 'idempotent-write') return 'write';
+  if (g === 'guarded') return allowDestructive ? 'destructive' : 'write';
+  return g;
 }
 
 /**
@@ -100,8 +118,9 @@ export function toolGroup(name: string): ToolGroup | undefined {
  * reaches only the Metabase instance it is configured for, so openWorldHint is
  * false throughout.
  */
-export function toolAnnotations(name: string): ToolAnnotations | undefined {
-  switch (GROUPS.get(name)) {
+export function toolAnnotations(name: string, allowDestructive = false): ToolAnnotations | undefined {
+  const kind = GROUPS.get(name);
+  switch (kind === 'guarded' ? (allowDestructive ? 'destructive' : 'write') : kind) {
     case 'read':
       return { readOnlyHint: true, openWorldHint: false };
     case 'write':

@@ -14,10 +14,12 @@ Metabase (por defecto `analytics.clay.cl`) sin compartir credenciales directamen
    por request (modo HTTP Stream, vía headers `x-metabase-*`).
 2. Registra las herramientas MCP (`addDashboardTools`, `addDatabaseTools`,
    `addCardTools`, `addTableTools`, `addAdditionalTools`) sobre `FastMCP`, filtradas
-   según el modo (`--essential` por defecto, `--all`, `--read`, `--write`). Sin flag,
-   el modo sale de `METABASE_MCP_TOOLS` (`essential|all|read|write`); el flag gana.
-   En gracia-dev basta con poner esa variable en el `environment` del programa de
-   supervisord del HTTP Stream (`dist/server.js`, puerto 8011) y reiniciarlo.
+   según el modo (`--essential` por defecto, `--read`, `--write`, `--all`) y la flag
+   `--allow-destructive`. Sin flag, salen de `METABASE_MCP_TOOLS`
+   (`essential|read|write|all`) y `METABASE_MCP_ALLOW_DESTRUCTIVE` (`true|false`); la
+   flag gana. Ver «Grupos de tools». En gracia-dev basta con poner esas variables en el
+   `environment` del programa de supervisord del HTTP Stream (`dist/server.js`, puerto
+   8011) y reiniciarlo.
 3. Cada tool invoca `MetabaseClient` (`src/client/metabase-client.ts`), que llama a la
    REST API de Metabase (axios) usando la sesión/API key resuelta. En bases MongoDB,
    `execute_query` y `create_card` reciben el pipeline como JSON en `query` y la
@@ -73,6 +75,22 @@ herramientas». Una tool nueva tiene que entrar en un grupo: `tests/tool-annotat
 falla si falta. `validate_database` no guarda nada, pero conecta a un host que elige quien
 llama, así que va en escritura y no en lectura.
 
+Qué se carga según las flags (o sus variables de entorno):
+
+| Flags | Tools | Qué queda fuera |
+|---|---|---|
+| `--read` | 47 | todo lo que escribe |
+| `--write` | 80 | las 12 destructivas (borrados, `update_database`, `replace_table_csv`, `update_dashboard_cards`, `remove_cards_from_dashboard`, `revert_dashboard`, `discard_table_field_values`, links públicos borrados) |
+| `--write --allow-destructive` | 92 | nada |
+| `--all` | 92 | nada (implica `--allow-destructive`) |
+| `--essential` (por defecto) | las `isEssential` | además, las destructivas sin `--allow-destructive` |
+
+`put_dashboard_layout` y `manage_dashboard_tabs` arman pestañas y layouts, así que
+están en escritura; pero sin `--allow-destructive` rechazan (antes de escribir, con un
+`dry_run` previo) un cambio que borre tarjetas o pestañas. Con la flag cuentan como
+destructivas y su anotación lo dice. El interruptor lo lee `isDestructiveAllowed()`
+(`src/utils/tool-filters.ts`), que `server.ts` fija al arrancar.
+
 ## Gotchas de Metabase 0.63
 
 Verificados contra analytics.clay.cl (dashboard 621 y su copia de prueba 622):
@@ -124,7 +142,7 @@ src/
     additional-tools.ts   # colecciones, búsqueda, usuarios, actividad, playground links
   utils/
     config.ts             # carga y valida METABASE_URL / credenciales desde env vars
-    tool-filters.ts       # modo de tools: flags --essential/--all/--read/--write o METABASE_MCP_TOOLS
+    tool-filters.ts       # modo (--essential/--read/--write/--all) y --allow-destructive, o sus variables
     template-tags.ts      # {{variables}} del SQL nativo -> template tags (MBQL 5 y legacy)
     tool-annotations.ts   # grupo de cada tool (lectura, escritura, destructiva) -> anotaciones MCP
   types/                  # tipos de config y errores
@@ -202,8 +220,10 @@ escribible por su usuario (el archivo lleva credenciales cifradas: no copiarlo n
 respaldarlo junto con `JWT_SECRET`). Rotar `METABASE_MCP_GATEWAY_SECRET` invalida
 todos los grants y obliga a reconectar. No hay despliegue en gracia-prod.
 
-El programa del HTTP Stream (`dist/server.js`, puerto 8011) puede cargar todas las
-tools con `METABASE_MCP_TOOLS=all` en su `environment`; por defecto carga las `essential`.
+El programa del HTTP Stream (`dist/server.js`, puerto 8011) corre con
+`METABASE_MCP_TOOLS=write`: lectura y escritura, sin tools destructivas. Para habilitar
+borrados, agregar `METABASE_MCP_ALLOW_DESTRUCTIVE=true` y reiniciar; sin la variable,
+`put_dashboard_layout` y `manage_dashboard_tabs` tampoco borran tarjetas ni pestañas.
 
 **Gotcha detectado (no corregido en este levantamiento):** el `CMD` del `Dockerfile`
 ejecuta `node dist/index.js`, pero el build y `package.json.main` generan

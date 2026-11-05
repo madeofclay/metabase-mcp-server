@@ -1,90 +1,112 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { parseToolFilterOptions, toolAllowed } from '../src/utils/tool-filters.js';
+import { describe, it, expect } from 'vitest';
+import { parseToolFilterOptions, toolAllowed, type ToolFilterOptions } from '../src/utils/tool-filters.js';
 
-describe('parseToolFilterOptions', () => {
-  let originalArgv: string[];
+const run = (...flags: string[]) => ['node', 'server.js', ...flags];
+const opts = (mode: ToolFilterOptions['mode'], allowDestructive = false): ToolFilterOptions => ({ mode, allowDestructive });
 
-  beforeEach(() => {
-    originalArgv = process.argv.slice();
+describe('mode flags', () => {
+  it('defaults to essential, without destructive tools', () => {
+    expect(parseToolFilterOptions(run(), {})).toEqual(opts('essential'));
   });
 
-  afterEach(() => {
-    process.argv = originalArgv;
+  it('reads each mode flag', () => {
+    expect(parseToolFilterOptions(run('--essential'), {})).toEqual(opts('essential'));
+    expect(parseToolFilterOptions(run('--read'), {})).toEqual(opts('read'));
+    expect(parseToolFilterOptions(run('--write'), {})).toEqual(opts('write'));
   });
 
-  it('defaults to essential mode when no flags are passed', () => {
-    process.argv = ['node', 'server.js'];
-    expect(parseToolFilterOptions()).toEqual({ mode: 'essential' });
+  it('--all loads everything and allows destructive tools', () => {
+    expect(parseToolFilterOptions(run('--all'), {})).toEqual(opts('all', true));
   });
 
-  it('returns essential mode for --essential flag', () => {
-    process.argv = ['node', 'server.js', '--essential'];
-    expect(parseToolFilterOptions()).toEqual({ mode: 'essential' });
-  });
-
-  it('returns write mode for --write flag', () => {
-    process.argv = ['node', 'server.js', '--write'];
-    expect(parseToolFilterOptions()).toEqual({ mode: 'write' });
-  });
-
-  it('returns all mode for --all flag', () => {
-    process.argv = ['node', 'server.js', '--all'];
-    expect(parseToolFilterOptions()).toEqual({ mode: 'all' });
-  });
-
-  it('--all takes priority over --write', () => {
-    process.argv = ['node', 'server.js', '--write', '--all'];
-    expect(parseToolFilterOptions()).toEqual({ mode: 'all' });
-  });
-
-  it('--all takes priority over --essential', () => {
-    process.argv = ['node', 'server.js', '--essential', '--all'];
-    expect(parseToolFilterOptions()).toEqual({ mode: 'all' });
+  it('--all takes priority over the other modes', () => {
+    expect(parseToolFilterOptions(run('--write', '--all'), {})).toEqual(opts('all', true));
+    expect(parseToolFilterOptions(run('--essential', '--all'), {})).toEqual(opts('all', true));
   });
 });
 
 describe('METABASE_MCP_TOOLS', () => {
-  const argv = ['node', 'server.js'];
-
   it('sets the mode when no flag is given', () => {
-    expect(parseToolFilterOptions(argv, { METABASE_MCP_TOOLS: 'all' })).toEqual({ mode: 'all' });
-    expect(parseToolFilterOptions(argv, { METABASE_MCP_TOOLS: 'read' })).toEqual({ mode: 'read' });
-    expect(parseToolFilterOptions(argv, { METABASE_MCP_TOOLS: ' Write ' })).toEqual({ mode: 'write' });
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_TOOLS: 'read' })).toEqual(opts('read'));
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_TOOLS: ' Write ' })).toEqual(opts('write'));
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_TOOLS: 'all' })).toEqual(opts('all', true));
   });
 
   it('loses to a CLI flag', () => {
-    expect(parseToolFilterOptions([...argv, '--essential'], { METABASE_MCP_TOOLS: 'all' })).toEqual({ mode: 'essential' });
+    expect(parseToolFilterOptions(run('--essential'), { METABASE_MCP_TOOLS: 'all' })).toEqual(opts('essential'));
   });
 
   it('defaults to essential when empty', () => {
-    expect(parseToolFilterOptions(argv, { METABASE_MCP_TOOLS: '' })).toEqual({ mode: 'essential' });
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_TOOLS: '' })).toEqual(opts('essential'));
   });
 
   it('refuses an unknown value instead of loading another tool set', () => {
-    expect(() => parseToolFilterOptions(argv, { METABASE_MCP_TOOLS: 'everything' })).toThrow(/METABASE_MCP_TOOLS/);
+    expect(() => parseToolFilterOptions(run(), { METABASE_MCP_TOOLS: 'everything' })).toThrow(/METABASE_MCP_TOOLS/);
   });
 });
 
-describe('--read flag', () => {
-  it('selects read mode', () => {
-    expect(parseToolFilterOptions(['node', 'server.js', '--read'], {})).toEqual({ mode: 'read' });
+describe('allowing destructive tools', () => {
+  it('is off unless asked for', () => {
+    expect(parseToolFilterOptions(run('--write'), {}).allowDestructive).toBe(false);
+  });
+
+  it('is on with --allow-destructive, whatever the mode', () => {
+    expect(parseToolFilterOptions(run('--write', '--allow-destructive'), {})).toEqual(opts('write', true));
+    expect(parseToolFilterOptions(run('--allow-destructive'), {})).toEqual(opts('essential', true));
+  });
+
+  it('is on with METABASE_MCP_ALLOW_DESTRUCTIVE=true', () => {
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_TOOLS: 'write', METABASE_MCP_ALLOW_DESTRUCTIVE: 'true' }))
+      .toEqual(opts('write', true));
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_ALLOW_DESTRUCTIVE: '1' }).allowDestructive).toBe(true);
+  });
+
+  it('stays off with a false value', () => {
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_ALLOW_DESTRUCTIVE: 'false' }).allowDestructive).toBe(false);
+    expect(parseToolFilterOptions(run(), { METABASE_MCP_ALLOW_DESTRUCTIVE: '' }).allowDestructive).toBe(false);
+  });
+
+  it('refuses a value that is neither true nor false', () => {
+    expect(() => parseToolFilterOptions(run(), { METABASE_MCP_ALLOW_DESTRUCTIVE: 'maybe' })).toThrow(/ALLOW_DESTRUCTIVE/);
   });
 });
 
 describe('toolAllowed', () => {
-  it('read mode keeps read-only tools and drops anything that writes', () => {
-    expect(toolAllowed('read', { isRead: true })).toBe(true);
-    expect(toolAllowed('read', { isRead: true, isWrite: true })).toBe(false);
-    expect(toolAllowed('read', { isWrite: true })).toBe(false);
-    expect(toolAllowed('read', { isEssential: true })).toBe(false);
+  it('read mode keeps only the read group', () => {
+    expect(toolAllowed(opts('read'), 'search_content')).toBe(true);
+    expect(toolAllowed(opts('read'), 'create_card', { isWrite: true })).toBe(false);
+    expect(toolAllowed(opts('read'), 'delete_card', { isWrite: true })).toBe(false);
   });
 
-  it('keeps the existing modes as they were', () => {
-    expect(toolAllowed('essential', { isEssential: true })).toBe(true);
-    expect(toolAllowed('essential', { isRead: true })).toBe(false);
-    expect(toolAllowed('write', { isRead: true })).toBe(true);
-    expect(toolAllowed('write', { isWrite: true })).toBe(true);
-    expect(toolAllowed('write', { isEssential: true })).toBe(false);
-    expect(toolAllowed('all', {})).toBe(true);
+  it('write mode keeps reads and writes but no destructive tool', () => {
+    expect(toolAllowed(opts('write'), 'search_content')).toBe(true);
+    expect(toolAllowed(opts('write'), 'create_card')).toBe(true);
+    expect(toolAllowed(opts('write'), 'get_card_series')).toBe(true); // read tool without metadata
+    for (const n of ['delete_card', 'delete_dashboard', 'delete_collection', 'delete_database',
+      'update_database', 'replace_table_csv', 'update_dashboard_cards', 'revert_dashboard']) {
+      expect(toolAllowed(opts('write'), n), n).toBe(false);
+    }
+  });
+
+  it('write mode keeps the guarded layout tools, which then refuse to delete', () => {
+    expect(toolAllowed(opts('write'), 'put_dashboard_layout')).toBe(true);
+    expect(toolAllowed(opts('write'), 'manage_dashboard_tabs')).toBe(true);
+  });
+
+  it('destructive tools come back with allowDestructive', () => {
+    expect(toolAllowed(opts('write', true), 'delete_card')).toBe(true);
+    expect(toolAllowed(opts('write', true), 'update_database')).toBe(true);
+  });
+
+  it('essential mode keeps essential tools minus destructive ones', () => {
+    expect(toolAllowed(opts('essential'), 'search_content', { isEssential: true })).toBe(true);
+    expect(toolAllowed(opts('essential'), 'get_table_fks')).toBe(false);
+    expect(toolAllowed(opts('essential'), 'revert_dashboard', { isEssential: true })).toBe(false);
+    expect(toolAllowed(opts('essential', true), 'revert_dashboard', { isEssential: true })).toBe(true);
+  });
+
+  it('all mode keeps everything', () => {
+    expect(toolAllowed(opts('all', true), 'delete_database')).toBe(true);
+    expect(toolAllowed(opts('all', true), 'search_content')).toBe(true);
   });
 });
