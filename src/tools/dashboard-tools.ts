@@ -466,6 +466,45 @@ export function addDashboardTools(server: any, getClient: (ctx?: any) => Metabas
   });
 
   server.addTool({
+    name: "set_dashboard_filters",
+    description:
+      "Set a dashboard's filters and connect them to the {{variables}} of its native SQL cards in one call. parameters is the FULL filter list (e.g. {id:'f_mes', name:'Mes', slug:'mes', type:'date/month-year', sectionId:'date'}; for a fixed list add values_source_type:'static-list', values_source_config:{values:[...]}). map_by_tag says which variable each filter feeds ({f_mes:'p_mes'}): every native card with that variable gets the mapping, unless listed in exclude. Filter and variable types must match (date/* → date, string/* → text, number/* → number). Mappings of other filters are kept. Use dry_run: true to preview. Reports per card what got mapped and which filters do not apply.",
+    metadata: { isWrite: true, isEssential: true },
+    parameters: z.object({
+      dashboard_id: z.number().describe("The ID of the dashboard"),
+      parameters: z.array(z.object({ id: z.string() }).passthrough()).describe("Every filter the dashboard should have"),
+      map_by_tag: z.record(z.string()).describe("Filter id → variable name it feeds in the cards' SQL"),
+      exclude: z
+        .array(z.object({ dashcard_id: z.number(), parameter_id: z.string() }).strict())
+        .optional()
+        .describe("Dashcard/filter pairs to leave unconnected"),
+      dry_run: z.boolean().optional().describe("Validate and show the mappings without writing"),
+    }).strict(),
+    execute: async (args: {
+      dashboard_id: number;
+      parameters: any[];
+      map_by_tag: Record<string, string>;
+      exclude?: { dashcard_id: number; parameter_id: string }[];
+      dry_run?: boolean;
+    }, context: any) => {
+      const metabaseClient = getClient(context);
+      try {
+        const result = await metabaseClient.setDashboardFilters(args.dashboard_id, args.parameters, args.map_by_tag, {
+          exclude: args.exclude,
+          dryRun: args.dry_run,
+        });
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw new Error(
+          `Failed to set the filters of dashboard ${args.dashboard_id}: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      }
+    },
+  });
+
+  server.addTool({
     name: "put_dashboard_layout",
     description:
       "Write a dashboard's WHOLE layout in one atomic call: tabs, every card and text block, and optionally filters and width. dashcards is the COMPLETE list: positive id = existing dashcard (kept/moved), negative id = new one; any current dashcard missing from the list is DELETED and needs confirm_removals: true (same for tabs). New tabs use negative ids that dashcards reference in dashboard_tab_id. Text/heading blocks can be given as {id: -n, text: '## ...', display: 'text'|'heading', dashboard_tab_id, row, col, size_x, size_y}. Validates before writing (24-column grid, tabs, unique ids, filter mappings). Use dry_run: true first to see the diff and what would be removed. Returns real tab ids and previous_revision_id to undo with revert_dashboard.",

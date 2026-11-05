@@ -16,6 +16,14 @@ import {
     User
 } from "../types/metabase.js";
 
+import {
+  TagOverride,
+  buildTemplateTags,
+  nativeQueryOf,
+  tagObject,
+  variableTypeForFilter,
+} from "../utils/template-tags.js";
+
 export interface SafePutResult {
   dashboard: any;
   previous_revision_id: number | null;
@@ -684,6 +692,115 @@ export class MetabaseClient {
     return result;
   }
 
+  /**
+   * Sets a dashboard's filters and connects them to the variables of its native
+   * cards. `parameters` is the full filter list; `mapByTag` says which variable
+   * each filter feeds ({f_mes: 'p_mes'}). Every native card that has that
+   * variable gets the mapping, unless `exclude` lists the pair. Mappings of
+   * other filters are kept, except those pointing at a filter no longer in the
+   * list, which Metabase would reject.
+   *
+   * The target has no third element: with {"stage-number": 0} Metabase 0.63
+   * answers "invalid tuple size" for variables. Verified on 0.63: a
+   * 'date/month-year' filter on a 'date' variable arrives as '2026-09-01', and a
+   * 'string/=' static-list filter works on a 'text' variable.
+   */
+  async setDashboardFilters(
+    dashboardId: number,
+    parameters: any[],
+    mapByTag: Record<string, string>,
+    opts: { exclude?: { dashcard_id: number; parameter_id: string }[]; dryRun?: boolean } = {},
+  ): Promise<any> {
+    const current: any = await this.getDashboard(dashboardId);
+    const dashcards: any[] = current.dashcards || [];
+    const errors: string[] = [];
+
+    const paramById = new Map<string, any>();
+    for (const p of parameters) {
+      if (!p?.id) errors.push('every filter needs an id');
+      else if (paramById.has(p.id)) errors.push(`filter "${p.id}" appears twice`);
+      else paramById.set(p.id, p);
+    }
+    for (const pid of Object.keys(mapByTag)) {
+      if (!paramById.has(pid)) errors.push(`map_by_tag names filter "${pid}", which is not in parameters`);
+    }
+    const exclude = opts.exclude || [];
+    for (const e of exclude) {
+      if (!dashcards.some((dc) => dc.id === e.dashcard_id)) errors.push(`exclude names dashcard ${e.dashcard_id}, which is not on the dashboard`);
+    }
+    const excluded = (dcId: number, pid: string) => exclude.some((e) => e.dashcard_id === dcId && e.parameter_id === pid);
+    const fail = (): never => {
+      throw new Error(`Filters for dashboard ${dashboardId} are not valid:\n- ${errors.join('\n- ')}`);
+    };
+    // Wrong input fails before any card is fetched.
+    if (errors.length) fail();
+
+    // Each card's variables, from the GET when it embeds the card, else fetched once.
+    const tagsByCard = new Map<number, Map<string, string> | null>();
+    const variablesOf = async (dc: any): Promise<Map<string, string> | null> => {
+      if (tagsByCard.has(dc.card_id)) return tagsByCard.get(dc.card_id)!;
+      const dq = dc.card?.dataset_query ?? (await this.getCard(dc.card_id) as any).dataset_query;
+      const native = nativeQueryOf(dq);
+      const vars = native ? new Map(native.tags.map((t) => [t.name, t.type])) : null;
+      tagsByCard.set(dc.card_id, vars);
+      return vars;
+    };
+
+    const report: any[] = [];
+    const mapped = new Set(Object.keys(mapByTag));
+    const nextDashcards: any[] = [];
+    let dropped = 0;
+
+    for (const dc of dashcards) {
+      const kept = (dc.parameter_mappings || []).filter((m: any) => {
+        if (mapped.has(m.parameter_id)) return false; // replaced below
+        if (!paramById.has(m.parameter_id)) { dropped++; return false; }
+        return true;
+      });
+      if (dc.card_id === null || dc.card_id === undefined) {
+        nextDashcards.push({ ...dc, parameter_mappings: kept });
+        continue;
+      }
+      const vars = await variablesOf(dc);
+      const entry: any = { dashcard_id: dc.id, card_id: dc.card_id, mapped: [], not_applicable: [], excluded: [] };
+      const fresh: any[] = [];
+      for (const [pid, tag] of Object.entries(mapByTag)) {
+        if (excluded(dc.id, pid)) { entry.excluded.push(pid); continue; }
+        const varType = vars?.get(tag);
+        if (varType === undefined) { entry.not_applicable.push(pid); continue; }
+        const filter = paramById.get(pid);
+        const wants = filter ? variableTypeForFilter(String(filter.type || '')) : undefined;
+        if (filter && wants !== varType) {
+          errors.push(
+            `filter "${pid}" (type ${filter.type}) cannot feed variable {{${tag}}} of card ${dc.card_id}, which is ${varType}${wants ? `; it needs a ${wants} variable` : ''}`
+          );
+          continue;
+        }
+        fresh.push({ parameter_id: pid, card_id: dc.card_id, target: ['variable', ['template-tag', tag]] });
+        entry.mapped.push({ parameter_id: pid, tag });
+      }
+      if (!vars) entry.note = 'not a native question: only its existing mappings of other filters are kept';
+      report.push(entry);
+      nextDashcards.push({ ...dc, parameter_mappings: [...kept, ...fresh] });
+    }
+
+    if (errors.length) fail();
+
+    const result: any = await this.putDashboardSafe(
+      dashboardId,
+      { parameters, dashcards: nextDashcards },
+      { current, dryRun: opts.dryRun },
+    );
+    result.mappings = report;
+    result.dropped_mappings = dropped;
+    for (const pid of mapped) {
+      if (!report.some((r) => r.mapped.some((m: any) => m.parameter_id === pid))) {
+        (result.unmapped_filters ||= []).push(pid);
+      }
+    }
+    return result;
+  }
+
   /** Replaces ALL dashcards: any existing dashcard missing from `cards` is deleted. */
   async updateDashboardCards(dashboardId: number, cards: any[]): Promise<any> {
     return this.putDashboardSafe(dashboardId, { dashcards: cards });
@@ -765,6 +882,42 @@ export class MetabaseClient {
   async createCard(card: Partial<Card>): Promise<Card> {
     const response = await this.axiosInstance.post("/api/card", card);
     return response.data;
+  }
+
+  /**
+   * Replaces a native card's SQL, declaring a template tag for every {{variable}}
+   * in it. Keeps the query's format: MBQL 5 (stages, tags as a list, what 0.63
+   * returns) or legacy (native.query, tags as an object). Variables that already
+   * had a tag keep it unless `templateTags` says otherwise.
+   */
+  async updateCardSql(
+    id: number,
+    sql: string,
+    templateTags: Record<string, TagOverride> = {},
+    otherUpdates: Record<string, any> = {},
+  ): Promise<any> {
+    if (otherUpdates.dataset_query !== undefined) {
+      throw new Error('Pass either sql or updates.dataset_query, not both');
+    }
+    const card: any = await this.getCard(id);
+    const native = nativeQueryOf(card.dataset_query);
+    if (!native) throw new Error(`Card ${id} is not a native SQL question`);
+
+    const tags = buildTemplateTags(sql, id, templateTags, native.tags);
+    const datasetQuery = structuredClone(card.dataset_query);
+    if (native.format === 'mbql5') {
+      datasetQuery.stages[0].native = sql;
+      datasetQuery.stages[0]['template-tags'] = tags;
+    } else {
+      datasetQuery.native.query = sql;
+      datasetQuery.native['template-tags'] = tagObject(tags);
+    }
+    const response = await this.axiosInstance.put(`/api/card/${id}`, { ...otherUpdates, dataset_query: datasetQuery });
+    return {
+      card: response.data,
+      template_tags: tags.map((t) => ({ name: t.name, type: t.type, id: t.id })),
+      format: native.format,
+    };
   }
 
   async updateCard(id: number, updates: Partial<Card>, queryParams?: any): Promise<Card> {
